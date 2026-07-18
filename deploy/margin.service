@@ -1,0 +1,26 @@
+[Unit]
+Description=Margin — read-later server with JS/math rendering (FastAPI + headless Chromium)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=margin
+Group=margin
+WorkingDirectory=/opt/margin
+# Optional .env for MATHPIX_* credentials and OUTPUT_DIR
+EnvironmentFile=-/opt/margin/.env
+Environment=OUTPUT_DIR=/var/lib/margin/inbox
+ExecStart=/opt/margin/.venv/bin/python app.py --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+# Hardening — kept moderate: headless Chromium needs /dev/shm and a writable
+# home (Playwright browser cache lives in ~/.cache/ms-playwright).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/margin
+
+[Install]
+WantedBy=multi-user.target

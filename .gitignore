@@ -1,0 +1,13 @@
+# Secrets — Mathpix credentials live here
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime
+server.log
+
+# macOS
+.DS_Store

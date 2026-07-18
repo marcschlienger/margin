@@ -1,0 +1,974 @@
+"""Read-It-Later server — saves web pages with JS/math rendering intact.
+
+POST /save       { "url": "https://...", "formats": ["pdf", "md"] }
+POST /save-url   { "url": "https://..." }   Markdown pipeline (legacy alias)
+POST /save-pdf   multipart form, field "file"
+GET  /health
+
+Output directory: --output-dir flag > OUTPUT_DIR env var > platform default.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import shutil
+import subprocess
+import sys
+import traceback
+import unicodedata
+from contextlib import asynccontextmanager
+from datetime import date
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+import trafilatura
+from bs4 import BeautifulSoup, NavigableString
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from pydantic import BaseModel, field_validator
+
+from render import (
+    CHROME_UA,
+    Renderer,
+    RendererUnavailable,
+    looks_blocked,
+    looks_missing,
+)
+
+load_dotenv()
+
+MATHPIX_APP_ID  = os.getenv("MATHPIX_APP_ID", "")
+MATHPIX_APP_KEY = os.getenv("MATHPIX_APP_KEY", "")
+MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB cap on PDF uploads
+
+
+def _default_output_dir() -> Path:
+    if sys.platform == "darwin":  # original iCloud-inbox workflow
+        return (
+            Path.home()
+            / "Library/Mobile Documents/com~apple~CloudDocs/ReadLater/inbox"
+        )
+    return Path.home() / "ReadLater" / "inbox"
+
+
+# Where saved files land. Overridden by the --output-dir CLI flag (see bottom).
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR") or _default_output_dir()).expanduser()
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    application.state.client = httpx.AsyncClient(
+        timeout=30, follow_redirects=True, headers={"User-Agent": CHROME_UA}
+    )
+    application.state.renderer = Renderer()
+    yield
+    await application.state.renderer.close()
+    await application.state.client.aclose()
+
+
+app = FastAPI(title="Margin", version="2.0.0", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Math-character / function tables — referenced by the MathML→LaTeX converter
+# and by the Unicode wrapping pass, so they must be defined before either.
+# ---------------------------------------------------------------------------
+
+_UNICODE_TO_LATEX = {
+    "α": r"\alpha",   "β": r"\beta",    "γ": r"\gamma",   "δ": r"\delta",
+    "ε": r"\epsilon", "ζ": r"\zeta",    "η": r"\eta",     "θ": r"\theta",
+    "ι": r"\iota",    "κ": r"\kappa",   "λ": r"\lambda",  "μ": r"\mu",
+    "ν": r"\nu",      "ξ": r"\xi",      "π": r"\pi",      "ρ": r"\rho",
+    "σ": r"\sigma",   "τ": r"\tau",     "υ": r"\upsilon", "φ": r"\phi",
+    "χ": r"\chi",     "ψ": r"\psi",     "ω": r"\omega",
+    "Γ": r"\Gamma",   "Δ": r"\Delta",   "Θ": r"\Theta",   "Λ": r"\Lambda",
+    "Ξ": r"\Xi",      "Π": r"\Pi",      "Σ": r"\Sigma",   "Υ": r"\Upsilon",
+    "Φ": r"\Phi",     "Ψ": r"\Psi",     "Ω": r"\Omega",
+    "ℓ": r"\ell",     "∞": r"\infty",   "∂": r"\partial", "∇": r"\nabla",
+    "∑": r"\sum",     "∏": r"\prod",    "∫": r"\int",     "√": r"\sqrt",
+    "≈": r"\approx",  "≠": r"\neq",     "≤": r"\leq",     "≥": r"\geq",
+    "→": r"\to",      "←": r"\leftarrow", "↔": r"\leftrightarrow",
+    "±": r"\pm",      "×": r"\times",   "÷": r"\div",     "·": r"\cdot",
+}
+_MATHML_OP_MAP = {
+    "−": "-", "×": r"\times", "÷": r"\div",
+    "≈": r"\approx", "≤": r"\leq", "≥": r"\geq", "≠": r"\neq",
+    "∞": r"\infty", "∑": r"\sum", "∫": r"\int", "∏": r"\prod",
+    "⁡": "",  # invisible function application
+    "→": r"\to", "←": r"\leftarrow", "↔": r"\leftrightarrow",
+    "±": r"\pm", "∓": r"\mp", "∂": r"\partial", "∇": r"\nabla",
+    "…": r"\ldots", "⋯": r"\cdots", "·": r"\cdot",
+    "%": r"\%",
+}
+_MATHML_FUNC = {
+    "ln", "log", "sin", "cos", "tan", "cot", "sec", "csc",
+    "arcsin", "arccos", "arctan", "exp", "lim", "max", "min",
+    "det", "ker", "dim", "deg", "gcd", "sup", "inf",
+}
+
+
+# ---------------------------------------------------------------------------
+# Title / filename / frontmatter helpers
+# ---------------------------------------------------------------------------
+
+# Strip a trailing " | Site Name", " — Site Name", " - Site Name" from titles.
+_RE_TITLE_SUFFIX = re.compile(r"\s+[|—–\-]\s+[^|—–\-]+$")
+
+
+def _clean_title(title: str) -> str:
+    title = title.strip()
+    cleaned = _RE_TITLE_SUFFIX.sub("", title)
+    return cleaned if cleaned else title
+
+
+def _slugify(text: str, max_len: int = 60) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^\w\s-]", "", text.lower())
+    text = re.sub(r"[-\s]+", "-", text).strip("-")
+    return text[:max_len] or "untitled"
+
+
+def _filename(title: str, ext: str = "md") -> str:
+    return f"{date.today().isoformat()}-{_slugify(title)}.{ext}"
+
+
+def _unique_path(path: Path) -> Path:
+    """Return `path` if free, else the first `<stem>-2.<ext>`, `-3.<ext>` etc."""
+    if not path.exists():
+        return path
+    i = 2
+    while (candidate := path.with_stem(f"{path.stem}-{i}")).exists():
+        i += 1
+    return candidate
+
+
+def _yaml_quote(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _frontmatter(title: str, source_url: str | None = None,
+                 has_math: bool = True) -> str:
+    lines = ["---", f"title: {_yaml_quote(title)}"]
+    if source_url:
+        lines.append(f"source_url: {_yaml_quote(source_url)}")
+    lines += [
+        f"date_saved: {date.today().isoformat()}",
+        f"tags: [readlater{', math' if has_math else ''}]",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Multi-format output (.md + Pandoc → .tex + .org)
+# ---------------------------------------------------------------------------
+
+# Pandoc's standalone LaTeX template is huge (KOMA, microtype, fontspec, ...) and
+# its preamble breaks pdflatex on common Unicode (↩ footnote-back arrows, etc.).
+# We generate a minimal article ourselves: produce just the body via `pandoc -t
+# latex` and wrap it in this preamble.
+_LATEX_PREAMBLE = r"""% !TEX TS-program = pdflatex
+% !TEX encoding = UTF-8 Unicode
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+
+% Pandoc emits \tightlist inside compact bullet lists; provide it so the
+% body compiles without the standalone template.
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+
+\title{__TITLE__}
+\date{__DATE__}
+
+\begin{document}
+\maketitle
+
+__BODY__
+\end{document}
+
+%%% Local Variables:
+%%% mode: latex
+%%% TeX-master: t
+%%% End:
+"""
+
+# Unicode characters that pdflatex cannot typeset and that carry no semantic
+# weight in our context (footnote-back arrows, etc.). Stripped from the body
+# before it reaches Pandoc.
+_PDFLATEX_DROP = {
+    "↩": "",  # ↩  leftwards arrow with hook
+    "↪": "",  # ↪  rightwards arrow with hook
+    "↺": "",  # ↺
+    "↻": "",  # ↻
+    "⏎": "",  # ⏎  return symbol
+}
+
+
+def _strip_pdflatex_unsafe(text: str) -> str:
+    for ch, repl in _PDFLATEX_DROP.items():
+        text = text.replace(ch, repl)
+    return text
+
+
+def _latex_escape_title(s: str) -> str:
+    """Minimal escaping for a title that goes inside \\title{...}."""
+    table = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+             "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
+             "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
+    return "".join(table.get(c, c) for c in s)
+
+
+def _run_pandoc(args: list[str], label: str) -> tuple[int, str, str]:
+    """Run pandoc, returning (returncode, stdout, stderr). -1 on missing/timeout."""
+    try:
+        r = subprocess.run(["pandoc", *args], capture_output=True, timeout=30, text=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"[pandoc] {label} skipped: {e}", file=sys.stderr, flush=True)
+        return -1, "", str(e)
+    if r.returncode != 0:
+        print(f"[pandoc] {label} failed: {r.stderr.strip()}",
+              file=sys.stderr, flush=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+# Read source as GFM with YAML frontmatter — handles fenced code, tables, and
+# our `---` metadata block more predictably than Pandoc's default flavour.
+_PANDOC_FROM = ["-f", "gfm+yaml_metadata_block"]
+
+
+def _write_tex(md_path: Path, tex_path: Path, title: str) -> None:
+    rc, body, _ = _run_pandoc(
+        [*_PANDOC_FROM, str(md_path), "-t", "latex"],
+        f"latex {md_path.name}",
+    )
+    if rc != 0:
+        return
+    body = _strip_pdflatex_unsafe(body)
+    tex = (_LATEX_PREAMBLE
+           .replace("__TITLE__", _latex_escape_title(title))
+           .replace("__DATE__", date.today().isoformat())
+           .replace("__BODY__", body))
+    tex_path.write_text(tex, encoding="utf-8")
+
+
+def _write_all_formats(filename: str, md_content: str, title: str) -> Path:
+    """Write .md (collision-safe), then derive .tex and .org via Pandoc."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    md_path = _unique_path(OUTPUT_DIR / filename)
+    md_path.write_text(md_content, encoding="utf-8")
+
+    _write_tex(md_path, md_path.with_suffix(".tex"), title)
+    _run_pandoc(
+        [*_PANDOC_FROM, str(md_path), "-o", str(md_path.with_suffix(".org"))],
+        f"org {md_path.name}",
+    )
+
+    return md_path
+
+
+# ---------------------------------------------------------------------------
+# URL → Markdown  (HTML-source math extraction, no OCR needed)
+# ---------------------------------------------------------------------------
+
+# Match \[...\] and \(...\) emitted by MathJax 3 / KaTeX into plain text
+_RE_BLOCK  = re.compile(r"\\\[(.+?)\\\]", re.DOTALL)
+_RE_INLINE = re.compile(r"\\\((.+?)\\\)")
+# Wikipedia wraps every formula in {\displaystyle ...} — strip the outer wrapper
+_RE_DISPLAYSTYLE = re.compile(r"^\{\\displaystyle\s+(.*)\}\s*$", re.DOTALL)
+_RE_LATEX_ALT = re.compile(r"\\[a-zA-Z]|[_^]\{")
+
+
+def _unwrap_displaystyle(latex: str) -> str:
+    m = _RE_DISPLAYSTYLE.match(latex.strip())
+    return m.group(1).strip() if m else latex.strip()
+
+
+def _math_replacement(latex: str, display: bool) -> str:
+    latex = _unwrap_displaystyle(latex)
+    return f"\n$$\n{latex}\n$$\n" if display else f"${latex}$"
+
+
+def _mathml_kids(node):
+    return [c for c in node.children
+            if not (isinstance(c, NavigableString) and not str(c).strip())]
+
+
+def _mathml_to_latex(node) -> str:
+    """Recursively convert a MathML BeautifulSoup node to a LaTeX string."""
+    if isinstance(node, NavigableString):
+        return str(node)
+
+    tag = node.name
+
+    def render_all():
+        return "".join(_mathml_to_latex(c) for c in node.children)
+
+    def k():
+        return _mathml_kids(node)
+
+    if tag == "mi":
+        text = node.get_text()
+        if text in _MATHML_FUNC:
+            return f"\\{text}"
+        if text in _MATHML_OP_MAP:  # ellipsis sometimes appears in <mi>
+            return _MATHML_OP_MAP[text]
+        return _UNICODE_TO_LATEX.get(text, text)
+
+    if tag == "mn":
+        return node.get_text()
+
+    if tag == "mo":
+        return _MATHML_OP_MAP.get(node.get_text(), node.get_text())
+
+    if tag in ("mrow", "mstyle", "math"):
+        return render_all()
+
+    if tag == "msup":
+        kids = k()
+        if len(kids) == 2:
+            return f"{{{_mathml_to_latex(kids[0])}}}^{{{_mathml_to_latex(kids[1])}}}"
+        return render_all()
+
+    if tag == "msub":
+        kids = k()
+        if len(kids) == 2:
+            return f"{{{_mathml_to_latex(kids[0])}}}_{{{_mathml_to_latex(kids[1])}}}"
+        return render_all()
+
+    if tag == "msubsup":
+        kids = k()
+        if len(kids) == 3:
+            b, sub, sup = (_mathml_to_latex(kids[i]) for i in range(3))
+            return f"{{{b}}}_{{{sub}}}^{{{sup}}}"
+        return render_all()
+
+    if tag == "mfrac":
+        kids = k()
+        if len(kids) == 2:
+            return f"\\frac{{{_mathml_to_latex(kids[0])}}}{{{_mathml_to_latex(kids[1])}}}"
+        return render_all()
+
+    if tag == "msqrt":
+        return f"\\sqrt{{{render_all()}}}"
+
+    if tag == "mroot":
+        kids = k()
+        if len(kids) == 2:
+            return f"\\sqrt[{_mathml_to_latex(kids[1])}]{{{_mathml_to_latex(kids[0])}}}"
+        return render_all()
+
+    if tag == "mspace":
+        return r"\,"
+
+    if tag == "mtext":
+        return f"\\text{{{node.get_text()}}}"
+
+    if tag == "mover":
+        kids = k()
+        if len(kids) == 2:
+            base, acc = _mathml_to_latex(kids[0]), _mathml_to_latex(kids[1])
+            acc_map = {"→": r"\vec", "˙": r"\dot", "¨": r"\ddot",
+                       "^": r"\hat", "‾": r"\bar", "~": r"\tilde"}
+            fn = acc_map.get(acc, r"\overset{" + acc + "}")
+            return f"{fn}{{{base}}}"
+        return render_all()
+
+    if tag == "munder":
+        kids = k()
+        if len(kids) == 2:
+            return f"\\underset{{{_mathml_to_latex(kids[1])}}}{{{_mathml_to_latex(kids[0])}}}"
+        return render_all()
+
+    if tag == "semantics":
+        kids = k()
+        return _mathml_to_latex(kids[0]) if kids else render_all()
+
+    if tag == "annotation":
+        return ""
+
+    return render_all()
+
+
+def _replace_math_elements(soup: BeautifulSoup) -> None:
+    """Mutate soup in-place: replace every math element with $...$ / $$...$$ text.
+
+    Strategies in priority order:
+      1.  Wikipedia / MediaWiki  — <span class="mwe-math-element[-inline|-block]">
+      1b. MathJax 3 rendered output — <mjx-container> (recover from assistive MathML)
+      2.  General MathML w/ LaTeX annotation — <math> with <annotation encoding="application/x-tex">
+      2b. Raw MathML            — <math> with no annotation (converted structurally)
+      3.  KaTeX                  — <span class="katex"> with annotation inside
+      4.  MathJax 2              — <script type="math/tex[; mode=display]">
+      5.  Image math             — <img alt="LATEX"> (SVG/PNG rendered formulas)
+    """
+    # 1. Wikipedia mwe-math-element spans
+    for span in soup.find_all("span", class_="mwe-math-element"):
+        ann = span.find("annotation", attrs={"encoding": "application/x-tex"})
+        if not ann:
+            continue
+        classes = " ".join(span.get("class", []))
+        display = "block" in classes and "inline" not in classes
+        span.replace_with(_math_replacement(ann.get_text(), display))
+
+    # 1b. MathJax 3 rendered output. After client-side typesetting the TeX
+    # source is gone from the DOM text; recover it from the assistive-MathML
+    # copy inside the container. Must run before the generic <math> pass so
+    # the whole container (including its SVG/CHTML duplicate) is replaced.
+    for container in soup.find_all("mjx-container"):
+        math = container.find("math")
+        display = container.get("display") == "true" or (
+            math is not None and math.get("display") == "block"
+        )
+        latex = ""
+        if math is not None:
+            ann = math.find("annotation", attrs={"encoding": "application/x-tex"})
+            latex = (
+                ann.get_text() if ann
+                else (math.get("alttext") or _mathml_to_latex(math))
+            )
+        if latex.strip():
+            container.replace_with(_math_replacement(latex, display))
+        else:
+            container.decompose()
+
+    # 2. Bare <math> elements — prefer embedded LaTeX annotation, then alttext,
+    #    then structural MathML→LaTeX conversion as last resort
+    for math in soup.find_all("math"):
+        display = math.get("display") == "block"
+        ann = math.find("annotation", attrs={"encoding": "application/x-tex"})
+        if ann:
+            math.replace_with(_math_replacement(ann.get_text(), display))
+        elif math.get("alttext"):
+            math.replace_with(_math_replacement(math["alttext"], display))
+        else:
+            latex = _mathml_to_latex(math)
+            if latex.strip():
+                math.replace_with(_math_replacement(latex, display))
+
+    # 3. KaTeX rendered spans  (.katex wraps both inline and display)
+    for katex in soup.find_all(class_="katex"):
+        ann = katex.find("annotation", attrs={"encoding": "application/x-tex"})
+        if ann:
+            display = bool(katex.find_parent(class_="katex-display"))
+            katex.replace_with(_math_replacement(ann.get_text(), display))
+
+    # 4. MathJax 2 script tags — type is "math/tex", optionally with a
+    # "; mode=display" suffix (spacing around ";" varies between sites).
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"^\s*math/tex")}):
+        display = "display" in tag.get("type", "")
+        tag.replace_with(_math_replacement(tag.string or "", display))
+
+    # 5. Image-rendered math: <img alt="LATEX ..."> (e.g. SVG formula images).
+    for img in soup.find_all("img"):
+        alt = img.get("alt", "")
+        if not _RE_LATEX_ALT.search(alt):
+            continue
+        parent = img.parent
+        sole = len([s for s in parent.children if str(s).strip()]) == 1
+        display = sole and parent.name in ("p", "div", "figure", "td", "li")
+        img.replace_with(_math_replacement(alt, display))
+
+    # Remove any leftover rendered MathJax output nodes (duplicates)
+    for node in soup.find_all(True, class_=re.compile(r"MathJax|mjx-", re.I)):
+        node.decompose()
+
+
+def _is_footnote_marker(tag) -> bool:
+    """Heuristic: does this <sub>/<sup> look like a footnote anchor (not math)?"""
+    content = tag.get_text().strip()
+    # Bracketed numbers ([1], [12]) and footnote symbols are always footnotes.
+    if re.fullmatch(r"\[\d+\]|[*†‡§¶]", content):
+        return True
+    # Wrapped in or containing an <a> — clicking it jumps to a footnote.
+    if tag.find_parent("a") or tag.find("a"):
+        return True
+    # Bare 1–3 digits AND not directly after a letter/digit (so x², H₂O survive).
+    if tag.name == "sup" and re.fullmatch(r"\d{1,3}", content):
+        prev = tag.previous_sibling
+        if prev is None or not isinstance(prev, NavigableString):
+            return True
+        prev_text = str(prev).rstrip()
+        if not prev_text or not prev_text[-1].isalnum():
+            return True
+    return False
+
+
+def _preserve_sub_sup(soup: BeautifulSoup) -> None:
+    """Convert <sub>/<sup> to LaTeX _{} / ^{} so trafilatura preserves them.
+
+    Skips footnote markers — see `_is_footnote_marker`. Footnote `<sup>1</sup>`
+    anchors would otherwise become spurious `^{1}` math superscripts in prose.
+    """
+    for tag in soup.find_all(["sub", "sup"]):
+        content = tag.get_text()
+        if not content:
+            continue
+        if _is_footnote_marker(tag):
+            tag.decompose()  # drop entirely — no useful semantic in standalone doc
+            continue
+        notation = "_{%s}" if tag.name == "sub" else "^{%s}"
+        tag.replace_with(notation % content)
+
+
+# A display block or an inline span — used to protect existing math regions
+# from the prose-wrapping pass below.
+_RE_MATH_SPAN = re.compile(r"\$\$.*?\$\$|(?<!\$)\$(?!\$)[^$\n]+\$", re.DOTALL)
+
+_RE_UNICODE_SYM = re.compile(
+    r"(?<![A-Za-z$\\])("
+    + "|".join(map(re.escape, _UNICODE_TO_LATEX))
+    + r")(?![A-Za-z$])"
+)
+
+
+def _apply_unicode_latex(body: str) -> str:
+    """Convert Unicode math symbols to LaTeX.
+
+    Inside existing math regions ($...$ and $$...$$) symbols become their LaTeX
+    commands; in prose, isolated symbols are additionally wrapped in $...$.
+    Processing the two separately keeps the prose pass from nesting a new $...$
+    inside an existing block.
+    """
+    def wrap_symbol(m: re.Match) -> str:
+        return f"${_UNICODE_TO_LATEX[m.group(0)]}$"
+
+    def convert_in_math(math: str) -> str:
+        for uni, latex in _UNICODE_TO_LATEX.items():
+            if uni in math:
+                # Trailing space so the command can't fuse with a following letter
+                math = math.replace(uni, latex + " ")
+        return math
+
+    out, pos = [], 0
+    for m in _RE_MATH_SPAN.finditer(body):
+        out.append(_RE_UNICODE_SYM.sub(wrap_symbol, body[pos:m.start()]))
+        out.append(convert_in_math(m.group(0)))
+        pos = m.end()
+    out.append(_RE_UNICODE_SYM.sub(wrap_symbol, body[pos:]))
+    body = "".join(out)
+
+    # Merge $X$_{n} / $X$^{n} → $X_{n}$ / $X^{n}$
+    body = re.sub(r"\$([^$]+)\$([_^]\{[^}]+\})", r"$\1\2$", body)
+    return body
+
+
+def _escape_math_special(body: str) -> str:
+    """Escape characters that are valid in MathJax but break LaTeX compilation."""
+    def fix(m: re.Match) -> str:
+        return re.sub(r"(?<!\\)%", r"\\%", m.group(0))
+
+    body = re.sub(r"\$\$.+?\$\$", fix, body, flags=re.DOTALL)
+    body = re.sub(r"(?<!\$)\$(?!\$)[^$\n]+\$", fix, body)
+    return body
+
+
+def _extract_url_content(html: str, url: str) -> tuple[str, str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    og = soup.find("meta", property="og:title")
+    raw_title = (og.get("content") if og else None) or (
+        soup.title.get_text() if soup.title else url
+    )
+    title = _clean_title(raw_title)
+
+    _replace_math_elements(soup)
+    _preserve_sub_sup(soup)
+
+    body = trafilatura.extract(
+        str(soup),
+        include_formatting=True,
+        output_format="markdown",
+        with_metadata=False,
+        include_links=False,
+    ) or ""
+
+    body = _RE_BLOCK.sub(r"\n$$\n\1\n$$\n", body)
+    body = _RE_INLINE.sub(r"$\1$", body)
+    body = _apply_unicode_latex(body)
+    body = _escape_math_special(body)
+
+    return title, body
+
+
+# ---------------------------------------------------------------------------
+# PDF → Markdown via Mathpix /v3/pdf  (async with polling)
+# ---------------------------------------------------------------------------
+
+# `.mmd` is the default output of /v3/pdf — it's always generated and fetchable
+# at /v3/pdf/{pdf_id}.mmd. `conversion_formats` is only for *additional* outputs
+# (docx, tex.zip, html); listing "mmd" there is now rejected as unknown.
+_MATHPIX_PDF_OPTIONS = (
+    '{"math_inline_delimiters":["$","$"],'
+    '"math_display_delimiters":["$$","$$"],'
+    '"rm_spaces":true}'
+)
+
+
+def _mathpix_headers() -> dict[str, str]:
+    return {"app_id": MATHPIX_APP_ID, "app_key": MATHPIX_APP_KEY}
+
+
+async def _mathpix_pdf(pdf_bytes: bytes) -> str:
+    """Upload PDF, poll until done, return MMD text."""
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(
+            "https://api.mathpix.com/v3/pdf",
+            headers=_mathpix_headers(),
+            files={"file": ("document.pdf", pdf_bytes, "application/pdf")},
+            data={"options_json": _MATHPIX_PDF_OPTIONS},
+        )
+        resp.raise_for_status()
+        pdf_id = resp.json().get("pdf_id")
+        if not pdf_id:
+            raise HTTPException(502, detail=f"Mathpix upload failed: {resp.text}")
+
+        for _ in range(60):  # ~3 min @ 3s polls
+            await asyncio.sleep(3)
+            check = await client.get(
+                f"https://api.mathpix.com/v3/pdf/{pdf_id}",
+                headers=_mathpix_headers(),
+            )
+            check.raise_for_status()
+            status = check.json().get("status", "")
+            if status == "completed":
+                break
+            if status == "error":
+                raise HTTPException(502, detail=f"Mathpix error: {check.text}")
+        else:
+            raise HTTPException(504, detail="Mathpix timed out (>3 min)")
+
+        mmd = await client.get(
+            f"https://api.mathpix.com/v3/pdf/{pdf_id}.mmd",
+            headers=_mathpix_headers(),
+        )
+        mmd.raise_for_status()
+        return mmd.text
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+def _err(msg: str) -> dict:
+    """Uniform error shape — keeps HTTP 200 so iOS Shortcuts can surface the message."""
+    return {"status": "error", "filename": "", "message": msg}
+
+
+def _clean_shortcut_url(v: str) -> str:
+    """Repair URLs mangled by iOS Shortcuts.
+
+    Shortcuts has two known issues:
+    - Inserts whitespace inside long URLs when serialising to JSON.
+    - Occasionally sends the URL twice separated by whitespace.
+
+    Strategy: collapse all whitespace to nothing. If the result is exactly the
+    same URL twice concatenated, return one copy. This preserves URLs that
+    legitimately contained spaces in query strings (rare but legal).
+    """
+    joined = re.sub(r"\s+", "", v.strip())
+    if joined and len(joined) % 2 == 0 and joined[: len(joined) // 2] == joined[len(joined) // 2 :]:
+        return joined[: len(joined) // 2]
+    return joined
+
+
+def _validated_url(v: str) -> str:
+    url = _clean_shortcut_url(v)
+    scheme = urlparse(url).scheme.lower()
+    # Only web URLs — keeps the fetcher/headless browser away from file:// etc.
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Only http(s) URLs are supported, got: {url[:100]}")
+    return url
+
+
+class URLPayload(BaseModel):
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def strip_url(cls, v: str) -> str:
+        return _validated_url(v)
+
+
+class SavePayload(BaseModel):
+    url: str
+    formats: list[str] = ["pdf"]
+
+    @field_validator("url")
+    @classmethod
+    def strip_url(cls, v: str) -> str:
+        return _validated_url(v)
+
+    @field_validator("formats")
+    @classmethod
+    def check_formats(cls, v: list[str]) -> list[str]:
+        v = [f.lower().lstrip(".") for f in v] or ["pdf"]
+        unknown = set(v) - {"pdf", "md"}
+        if unknown:
+            raise ValueError(f"Unknown formats {sorted(unknown)}; use 'pdf' and/or 'md'")
+        return v
+
+
+@app.post("/echo")
+async def echo(request: Request):
+    """Debug endpoint — returns whatever the client sent, as JSON."""
+    body_bytes = await request.body()
+    try:
+        body = await request.json()
+    except Exception:
+        body = body_bytes.decode(errors="replace")
+    return {"method": request.method, "headers": dict(request.headers), "body": body}
+
+
+def _ok(md_path: Path, title: str) -> dict:
+    return {
+        "status": "ok",
+        "filename": md_path.name,
+        "title": title,
+        "path": str(md_path),
+    }
+
+
+def _log(label: str, msg: str) -> None:
+    print(f"[{label}] {msg}", file=sys.stderr, flush=True)
+
+
+# Bodies shorter than this suggest a client-side-rendered page (the article is
+# assembled in the browser) or a bot wall — worth retrying in headless Chromium.
+_THIN_BODY_CHARS = 200
+
+
+async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
+    """Return the raw bytes if `url` serves a PDF directly, else None."""
+    ctype = ""
+    try:
+        head = await client.head(url)
+        ctype = head.headers.get("content-type", "").lower()
+    except httpx.HTTPError:
+        pass  # many servers reject HEAD — fall back to the extension check
+    if "application/pdf" not in ctype and not urlparse(url).path.lower().endswith(".pdf"):
+        return None
+    try:
+        resp = await client.get(url)
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    if "application/pdf" not in resp.headers.get("content-type", "").lower():
+        return None
+    return resp.content
+
+
+def _write_binary(filename: str, data: bytes) -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _unique_path(OUTPUT_DIR / filename)
+    path.write_bytes(data)
+    return path
+
+
+@app.post("/save-url")
+async def save_url(payload: URLPayload, request: Request):
+    """Fetch a web page, extract content + math, save Markdown to the output dir."""
+    _log("save-url", f"fetching {payload.url}")
+    client: httpx.AsyncClient = request.app.state.client
+    renderer: Renderer = request.app.state.renderer
+
+    html, fetch_err, retry_render = None, "", True
+    try:
+        page = await client.get(payload.url)
+        page.raise_for_status()
+        html = page.text
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        fetch_err = f"Site returned {code}: {payload.url}"
+        # Only bot-wall-ish statuses are worth retrying in a real browser —
+        # a 404/410 is a genuine miss and would just save the error page.
+        retry_render = code in (401, 403, 406, 429, 503)
+    except httpx.RequestError as e:
+        fetch_err = f"Could not reach {payload.url}: {e}"
+
+    title, body = "", ""
+    if html is not None:
+        try:
+            title, body = _extract_url_content(html, payload.url)
+        except Exception as e:
+            _log("save-url", f"extract failed: {e}\n{traceback.format_exc()}")
+            return _err(f"Extraction failed: {e}")
+
+    # Plain fetch blocked or page is client-side rendered → retry in headless
+    # Chromium, which executes the JS before we extract.
+    if (
+        (html is None or len(body.strip()) < _THIN_BODY_CHARS)
+        and retry_render
+        and renderer.available
+    ):
+        reason = fetch_err or f"thin body ({len(body.strip())} chars)"
+        _log("save-url", f"{reason} — retrying with headless render")
+        try:
+            rendered = await renderer.render(payload.url)
+            r_title, r_body = _extract_url_content(rendered.html, payload.url)
+            if looks_blocked(rendered.title):
+                _log("save-url", f"render fallback blocked: {rendered.title!r}")
+            elif len(r_body.strip()) > len(body.strip()):
+                title = _clean_title(rendered.title) or r_title or title
+                body = r_body
+        except Exception as e:
+            _log("save-url", f"render fallback failed: {e}")
+
+    if not body.strip():
+        return _err(
+            fetch_err
+            or f"No article content could be extracted from {payload.url} — "
+               'try POST /save with {"formats": ["pdf"]} instead'
+        )
+    title = title or payload.url
+
+    md = _frontmatter(title, payload.url, has_math="$" in body) + "\n" + body
+    try:
+        md_path = _write_all_formats(_filename(title), md, title)
+    except Exception as e:
+        _log("save-url", f"write failed: {e}\n{traceback.format_exc()}")
+        return _err(f"Could not write file: {e}")
+    _log("save-url", f"saved → {md_path.name}")
+    return _ok(md_path, title)
+
+
+@app.post("/save")
+async def save(payload: SavePayload, request: Request):
+    """Save any web page. Format "pdf" renders it in headless Chromium (waits
+    for JS/MathJax/KaTeX to finish) and exports a PDF; "md" runs the
+    Markdown-extraction pipeline. Default is ["pdf"]."""
+    _log("save", f"{payload.formats} {payload.url}")
+    client: httpx.AsyncClient = request.app.state.client
+    renderer: Renderer = request.app.state.renderer
+
+    saved: list[str] = []
+    errors: list[str] = []
+    title = ""
+
+    if "pdf" in payload.formats:
+        try:
+            direct = await _fetch_pdf_bytes(client, payload.url)
+        except Exception as e:
+            _log("save", f"direct-pdf probe failed: {e}")
+            direct = None
+        if direct is not None:
+            # The URL already serves a PDF — store it as-is.
+            title = Path(urlparse(payload.url).path).stem or "document"
+            pdf_path = _write_binary(_filename(title, "pdf"), direct)
+            saved.append(pdf_path.name)
+            _log("save", f"saved direct PDF → {pdf_path.name}")
+        else:
+            try:
+                rendered = await renderer.render(payload.url)
+                if looks_blocked(rendered.title):
+                    raise RuntimeError(
+                        f"site blocked headless access ({rendered.title!r})"
+                    )
+                if looks_missing(rendered.title, rendered.status):
+                    raise RuntimeError(
+                        f"page looks like an error page "
+                        f"(status {rendered.status}, title {rendered.title!r})"
+                    )
+                title = _clean_title(rendered.title) or payload.url
+                pdf_path = _write_binary(_filename(title, "pdf"), rendered.pdf)
+                saved.append(pdf_path.name)
+                _log("save", f"saved → {pdf_path.name}")
+            except RendererUnavailable as e:
+                errors.append(str(e))
+            except Exception as e:
+                _log("save", f"render failed: {e}\n{traceback.format_exc()}")
+                errors.append(f"Could not render {payload.url}: {e}")
+
+    if "md" in payload.formats:
+        md_result = await save_url(URLPayload(url=payload.url), request)
+        if md_result.get("status") == "ok":
+            saved.append(md_result["filename"])
+            title = title or md_result["title"]
+        else:
+            errors.append(md_result.get("message", "markdown save failed"))
+
+    if not saved:
+        return _err("; ".join(errors) or "nothing saved")
+    return {
+        "status": "ok",
+        "title": title,
+        "files": saved,
+        "path": str(OUTPUT_DIR),
+        **({"warnings": errors} if errors else {}),
+    }
+
+
+@app.post("/save-pdf")
+async def save_pdf(file: UploadFile = File(...)):
+    """Convert PDF via Mathpix, save resulting Markdown to iCloud inbox."""
+    _log("save-pdf", f"received {file.filename}")
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        return _err("Expected a .pdf file")
+    if not MATHPIX_APP_ID or not MATHPIX_APP_KEY:
+        return _err("MATHPIX_APP_ID / MATHPIX_APP_KEY not set in .env")
+
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        return _err(f"PDF too large: {len(pdf_bytes)} bytes (max {MAX_PDF_BYTES})")
+
+    try:
+        mmd = await _mathpix_pdf(pdf_bytes)
+    except HTTPException as e:
+        _log("save-pdf", f"mathpix error: {e.detail}")
+        return _err(str(e.detail))
+    except Exception as e:
+        _log("save-pdf", f"mathpix crash: {e}\n{traceback.format_exc()}")
+        return _err(f"Mathpix call failed: {e}")
+
+    m = re.search(r"^#\s+(.+)$", mmd, re.MULTILINE)
+    title = _clean_title(m.group(1).strip() if m else Path(file.filename).stem)
+
+    md = _frontmatter(title, has_math="$" in mmd) + "\n" + mmd
+    try:
+        md_path = _write_all_formats(_filename(title), md, title)
+    except Exception as e:
+        _log("save-pdf", f"write failed: {e}\n{traceback.format_exc()}")
+        return _err(f"Could not write file: {e}")
+    _log("save-pdf", f"saved → {md_path.name}")
+    return _ok(md_path, title)
+
+
+@app.get("/health")
+async def health(request: Request):
+    exists = OUTPUT_DIR.exists()
+    return {
+        "status": "ok",
+        "output_dir": str(OUTPUT_DIR),
+        "output_dir_exists": exists,
+        "output_dir_writable": exists and os.access(OUTPUT_DIR, os.W_OK),
+        "saved_md_count": len(list(OUTPUT_DIR.glob("*.md"))) if exists else 0,
+        "saved_pdf_count": len(list(OUTPUT_DIR.glob("*.pdf"))) if exists else 0,
+        "pandoc_available": shutil.which("pandoc") is not None,
+        "playwright_available": request.app.state.renderer.available,
+        "mathpix_configured": bool(MATHPIX_APP_ID and MATHPIX_APP_KEY),
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="Margin — read-later server")
+    parser.add_argument(
+        "--output-dir",
+        help="Directory for saved files (overrides the OUTPUT_DIR env var)",
+    )
+    parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
+    args = parser.parse_args()
+    if args.output_dir:
+        OUTPUT_DIR = Path(args.output_dir).expanduser()
+    print(f"[startup] output dir: {OUTPUT_DIR}", file=sys.stderr, flush=True)
+    uvicorn.run(app, host=args.host, port=args.port)
