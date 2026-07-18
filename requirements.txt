@@ -7,3 +7,4 @@ python-dotenv>=1.0
 python-multipart>=0.0.9
 lxml>=5.0
 playwright>=1.49
+pypdf>=4.0

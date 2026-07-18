@@ -23,6 +23,8 @@ Output directory: --output-dir flag > OUTPUT_DIR env var > platform default.
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import os
 import re
 import shutil
@@ -52,6 +54,11 @@ from render import (
     looks_blocked,
     looks_missing,
 )
+
+try:
+    from pypdf import PdfReader
+except ModuleNotFoundError:  # optional — only used for direct-PDF titles
+    PdfReader = None
 
 load_dotenv()
 
@@ -547,10 +554,12 @@ def _preserve_sub_sup(soup: BeautifulSoup) -> None:
 # from the prose-wrapping pass below.
 _RE_MATH_SPAN = re.compile(r"\$\$.*?\$\$|(?<!\$)\$(?!\$)[^$\n]+\$", re.DOTALL)
 
+# Isolated = not adjacent to any letter (Unicode-aware: `[^\W\d_]` is "letter"),
+# so Greek prose like Πλάτων is left alone while a lone θ still gets wrapped.
 _RE_UNICODE_SYM = re.compile(
-    r"(?<![A-Za-z$\\])("
+    r"(?<![^\W\d_])(?<![$\\])("
     + "|".join(map(re.escape, _UNICODE_TO_LATEX))
-    + r")(?![A-Za-z$])"
+    + r")(?![^\W\d_])(?!\$)"
 )
 
 
@@ -725,6 +734,7 @@ class URLPayload(BaseModel):
 class SavePayload(BaseModel):
     url: str
     formats: list[str] = ["pdf"]
+    force: bool = False  # save again even if this URL was saved before
 
     @field_validator("url")
     @classmethod
@@ -809,31 +819,159 @@ def _write_binary(filename: str, data: bytes) -> Path:
     return path
 
 
-@app.post("/save-url")
-async def save_url(payload: URLPayload, request: Request):
-    """Fetch a web page, extract content + math, save Markdown to the output dir."""
-    _log("save-url", f"fetching {payload.url}")
+# --- Duplicate detection -----------------------------------------------------
+# Saved URLs are recorded in a small JSON index (url → file stems) inside the
+# output dir. On a repeat save the request is skipped with a note instead of
+# piling up -2/-3 copies; `"force": true` bypasses the check.
+
+def _norm_url(url: str) -> str:
+    """Canonical form for duplicate comparison: drop fragment, trailing '/'."""
+    p = urlparse(url)
+    path = p.path.rstrip("/") or "/"
+    return f"{p.scheme.lower()}://{p.netloc.lower()}{path}" + (
+        f"?{p.query}" if p.query else ""
+    )
+
+
+def _url_index_path() -> Path:
+    return OUTPUT_DIR / ".saved-urls.json"
+
+
+def _load_url_index() -> dict[str, list[str]]:
+    try:
+        idx = json.loads(_url_index_path().read_text(encoding="utf-8"))
+        return idx if isinstance(idx, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_url(url: str, stem: str) -> None:
+    idx = _load_url_index()
+    stems = idx.setdefault(_norm_url(url), [])
+    if stem not in stems:
+        stems.append(stem)
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        _url_index_path().write_text(json.dumps(idx, indent=1), encoding="utf-8")
+    except OSError as e:
+        _log("index", f"could not write URL index: {e}")
+
+
+def _files_for_stems(stems: set[str]) -> list[Path]:
+    files = []
+    for folder in (OUTPUT_DIR, _archive_dir()):
+        if folder.is_dir():
+            files += [f for f in folder.iterdir()
+                      if f.is_file() and f.stem in stems
+                      and f.suffix.lower() in _SERVE_EXTS]
+    return files
+
+
+def _find_existing(url: str) -> dict | None:
+    """Return {'files', 'title'} for a still-present earlier save of `url`."""
+    norm = _norm_url(url)
+    files = _files_for_stems(set(_load_url_index().get(norm, [])))
+    if not files:
+        # Saves that predate the index: match source_url in Markdown frontmatter
+        for folder in (OUTPUT_DIR, _archive_dir()):
+            if not folder.is_dir():
+                continue
+            for md in folder.glob("*.md"):
+                src = _read_frontmatter_field(md, "source_url")
+                if src and _norm_url(src) == norm:
+                    files = _files_for_stems({md.stem})
+                    break
+            if files:
+                break
+    if not files:
+        return None
+    files.sort(key=lambda f: _SERVE_EXTS.index(f.suffix.lower()))
+    md = next((f for f in files if f.suffix.lower() == ".md"), None)
+    title = (_read_frontmatter_field(md, "title") if md else None) or _pretty_stem(
+        files[0].stem
+    )
+    return {"files": [f.name for f in files], "title": title}
+
+
+def _duplicate_response(existing: dict) -> dict:
+    return {
+        "status": "ok",
+        "duplicate": True,
+        "title": existing["title"],
+        "files": existing["files"],
+        "filename": existing["files"][0],
+        "path": str(OUTPUT_DIR),
+        "message": f"Already saved ({existing['files'][0]}) — "
+                   'send "force": true to save again',
+    }
+
+
+# --- Direct-PDF titles -------------------------------------------------------
+
+_RE_ARXIV_PDF = re.compile(
+    r"^https?://arxiv\.org/pdf/(?P<id>[^?#]+?)(?:\.pdf)?/?$", re.I
+)
+
+
+def _pdf_metadata_title(data: bytes) -> str | None:
+    if PdfReader is None:
+        return None
+    try:
+        meta = PdfReader(io.BytesIO(data)).metadata
+        title = str(meta.title).strip() if meta and meta.title else ""
+        return title or None
+    except Exception:
+        return None
+
+
+async def _direct_pdf_title(client: httpx.AsyncClient, url: str,
+                            data: bytes) -> str:
+    """Best-effort title for a directly-downloaded PDF.
+
+    arXiv abstract page > embedded PDF metadata > URL path stem.
+    """
+    m = _RE_ARXIV_PDF.match(url)
+    if m:
+        try:
+            abs_page = await client.get(f"https://arxiv.org/abs/{m.group('id')}")
+            abs_page.raise_for_status()
+            soup = BeautifulSoup(abs_page.text, "html.parser")
+            if soup.title:
+                # arXiv titles look like "[1706.03762] Attention Is All You Need"
+                title = re.sub(r"^\[[^\]]+\]\s*", "", soup.title.get_text().strip())
+                if title:
+                    return title
+        except httpx.HTTPError as e:
+            _log("save", f"arXiv abs lookup failed: {e}")
+    return (_pdf_metadata_title(data)
+            or Path(urlparse(url).path).stem
+            or "document")
+
+
+async def _run_markdown_save(url: str, request: Request) -> dict:
+    """Markdown pipeline: fetch, extract content + math, write .md/.tex/.org."""
+    _log("save-url", f"fetching {url}")
     client: httpx.AsyncClient = request.app.state.client
     renderer: Renderer = request.app.state.renderer
 
     html, fetch_err, retry_render = None, "", True
     try:
-        page = await client.get(payload.url)
+        page = await client.get(url)
         page.raise_for_status()
         html = page.text
     except httpx.HTTPStatusError as e:
         code = e.response.status_code
-        fetch_err = f"Site returned {code}: {payload.url}"
+        fetch_err = f"Site returned {code}: {url}"
         # Only bot-wall-ish statuses are worth retrying in a real browser —
         # a 404/410 is a genuine miss and would just save the error page.
         retry_render = code in (401, 403, 406, 429, 503)
     except httpx.RequestError as e:
-        fetch_err = f"Could not reach {payload.url}: {e}"
+        fetch_err = f"Could not reach {url}: {e}"
 
     title, body = "", ""
     if html is not None:
         try:
-            title, body = _extract_url_content(html, payload.url)
+            title, body = _extract_url_content(html, url)
         except Exception as e:
             _log("save-url", f"extract failed: {e}\n{traceback.format_exc()}")
             return _err(f"Extraction failed: {e}")
@@ -848,8 +986,8 @@ async def save_url(payload: URLPayload, request: Request):
         reason = fetch_err or f"thin body ({len(body.strip())} chars)"
         _log("save-url", f"{reason} — retrying with headless render")
         try:
-            rendered = await renderer.render(payload.url)
-            r_title, r_body = _extract_url_content(rendered.html, payload.url)
+            rendered = await renderer.render(url)
+            r_title, r_body = _extract_url_content(rendered.html, url)
             if looks_blocked(rendered.title):
                 _log("save-url", f"render fallback blocked: {rendered.title!r}")
             elif len(r_body.strip()) > len(body.strip()):
@@ -861,19 +999,30 @@ async def save_url(payload: URLPayload, request: Request):
     if not body.strip():
         return _err(
             fetch_err
-            or f"No article content could be extracted from {payload.url} — "
+            or f"No article content could be extracted from {url} — "
                'try POST /save with {"formats": ["pdf"]} instead'
         )
-    title = title or payload.url
+    title = title or url
 
-    md = _frontmatter(title, payload.url, has_math="$" in body) + "\n" + body
+    md = _frontmatter(title, url, has_math="$" in body) + "\n" + body
     try:
         md_path = _write_all_formats(_filename(title), md, title)
     except Exception as e:
         _log("save-url", f"write failed: {e}\n{traceback.format_exc()}")
         return _err(f"Could not write file: {e}")
     _log("save-url", f"saved → {md_path.name}")
+    _record_url(url, md_path.stem)
     return _ok(md_path, title)
+
+
+@app.post("/save-url")
+async def save_url(payload: URLPayload, request: Request):
+    """Fetch a web page, extract content + math, save Markdown to the output dir."""
+    existing = _find_existing(payload.url)
+    if existing:
+        _log("save-url", f"duplicate of {existing['files'][0]}: {payload.url}")
+        return _duplicate_response(existing)
+    return await _run_markdown_save(payload.url, request)
 
 
 @app.post("/save")
@@ -884,6 +1033,12 @@ async def save(payload: SavePayload, request: Request):
     _log("save", f"{payload.formats} {payload.url}")
     client: httpx.AsyncClient = request.app.state.client
     renderer: Renderer = request.app.state.renderer
+
+    if not payload.force:
+        existing = _find_existing(payload.url)
+        if existing:
+            _log("save", f"duplicate of {existing['files'][0]}: {payload.url}")
+            return _duplicate_response(existing)
 
     saved: list[str] = []
     errors: list[str] = []
@@ -897,9 +1052,10 @@ async def save(payload: SavePayload, request: Request):
             direct = None
         if direct is not None:
             # The URL already serves a PDF — store it as-is.
-            title = Path(urlparse(payload.url).path).stem or "document"
+            title = _clean_title(await _direct_pdf_title(client, payload.url, direct))
             pdf_path = _write_binary(_filename(title, "pdf"), direct)
             saved.append(pdf_path.name)
+            _record_url(payload.url, pdf_path.stem)
             _log("save", f"saved direct PDF → {pdf_path.name}")
         else:
             try:
@@ -916,6 +1072,7 @@ async def save(payload: SavePayload, request: Request):
                 title = _clean_title(rendered.title) or payload.url
                 pdf_path = _write_binary(_filename(title, "pdf"), rendered.pdf)
                 saved.append(pdf_path.name)
+                _record_url(payload.url, pdf_path.stem)
                 _log("save", f"saved → {pdf_path.name}")
             except RendererUnavailable as e:
                 errors.append(str(e))
@@ -924,7 +1081,9 @@ async def save(payload: SavePayload, request: Request):
                 errors.append(f"Could not render {payload.url}: {e}")
 
     if "md" in payload.formats:
-        md_result = await save_url(URLPayload(url=payload.url), request)
+        # Skip the endpoint's duplicate check — this request already passed it
+        # (and the PDF just written above would otherwise count as a duplicate).
+        md_result = await _run_markdown_save(payload.url, request)
         if md_result.get("status") == "ok":
             saved.append(md_result["filename"])
             title = title or md_result["title"]
@@ -1011,7 +1170,8 @@ def _save_page_response(ok: bool, heading: str, detail: str) -> HTMLResponse:
 
 
 @app.get("/save-page", response_class=HTMLResponse)
-async def save_page(request: Request, url: str = "", formats: str = "pdf"):
+async def save_page(request: Request, url: str = "", formats: str = "pdf",
+                    force: bool = False):
     """Desktop-browser capture: open from a bookmarklet, get an HTML result.
 
     A bookmarklet opens this in a new tab (`window.open`). A top-level
@@ -1021,14 +1181,16 @@ async def save_page(request: Request, url: str = "", formats: str = "pdf"):
     """
     fmt_list = [f for f in re.split(r"[\s,]+", formats) if f]
     try:
-        payload = SavePayload(url=url, formats=fmt_list or ["pdf"])
+        payload = SavePayload(url=url, formats=fmt_list or ["pdf"], force=force)
     except ValueError as e:
         return _save_page_response(False, "Invalid request", str(e))
 
     result = await save(payload, request)
     if result.get("status") == "ok":
         files = ", ".join(result.get("files", []))
-        return _save_page_response(True, "Saved", f"{result.get('title', '')} → {files}")
+        heading = "Already saved" if result.get("duplicate") else "Saved"
+        return _save_page_response(True, heading,
+                                   f"{result.get('title', '')} → {files}")
     return _save_page_response(False, "Save failed",
                                result.get("message", "unknown error"))
 
@@ -1043,32 +1205,40 @@ _SERVE_EXTS = (".pdf", ".md", ".tex", ".org")  # order = display order
 _ARCHIVE_SUBDIR = "archive"
 _RE_SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
 
+# Placeholders (__ROWS__ etc.) are substituted with str.replace, so the CSS
+# and JS braces below need no escaping.
 _INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Margin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body {{ font: 16px/1.55 -apple-system, system-ui, sans-serif;
-          max-width: 46rem; margin: 3rem auto; padding: 0 1rem; color: #222; }}
-  h1 {{ font-size: 1.4rem; }}
-  h1 a {{ color: inherit; text-decoration: none; }}
-  form.saver {{ display: flex; gap: .6rem; align-items: center;
-                margin: 1rem 0 1.5rem; flex-wrap: wrap; }}
-  form.saver input[type=url] {{ flex: 1; min-width: 14rem; font: inherit;
-          padding: .45rem .6rem; border: 1px solid #bbb; border-radius: 6px; }}
-  form.saver label {{ font-size: .85rem; white-space: nowrap; }}
-  .tabs {{ margin-bottom: .8rem; font-size: .95rem; }}
-  .tabs a {{ margin-right: 1.2rem; }}
-  .item {{ padding: .7rem 0; border-bottom: 1px solid #e6e6e6;
-           display: flex; gap: 1rem; align-items: baseline; }}
-  .date {{ color: #999; font-size: .82rem; white-space: nowrap; }}
-  .main {{ flex: 1; }}
-  .main a.title {{ font-weight: 600; text-decoration: none; }}
-  .links {{ font-size: .82rem; margin-top: .15rem; }}
-  .links a {{ margin-right: .7rem; }}
-  button {{ font: inherit; font-size: .82rem; padding: .25rem .7rem;
-            border: 1px solid #bbb; border-radius: 6px; background: #f7f7f7;
-            cursor: pointer; }}
-  .empty {{ color: #999; margin-top: 2rem; }}
+  :root { color-scheme: light dark;
+          --muted: #8a8a8e; --line: #88888833; --btn: #88888818; }
+  body { font: 16px/1.55 -apple-system, system-ui, sans-serif;
+         max-width: 46rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  h1 a { color: inherit; text-decoration: none; }
+  form.saver { display: flex; gap: .6rem; align-items: center;
+               margin: 1rem 0 .8rem; flex-wrap: wrap; }
+  form.saver input[type=url], #filter {
+    flex: 1; min-width: 14rem; font: inherit; padding: .45rem .6rem;
+    border: 1px solid var(--muted); border-radius: 6px;
+    background: transparent; color: inherit; }
+  form.saver label { font-size: .85rem; white-space: nowrap; }
+  #filter { margin-bottom: 1rem; display: block; width: 100%;
+            box-sizing: border-box; }
+  .tabs { margin-bottom: .8rem; font-size: .95rem; }
+  .tabs a { margin-right: 1.2rem; }
+  .item { padding: .7rem 0; border-bottom: 1px solid var(--line);
+          display: flex; gap: 1rem; align-items: baseline; }
+  .date { color: var(--muted); font-size: .82rem; white-space: nowrap; }
+  .main { flex: 1; }
+  .main a.title { font-weight: 600; text-decoration: none; }
+  .links { font-size: .82rem; margin-top: .15rem; }
+  .links a { margin-right: .7rem; }
+  button { font: inherit; font-size: .82rem; padding: .25rem .7rem;
+           border: 1px solid var(--muted); border-radius: 6px;
+           background: var(--btn); color: inherit; cursor: pointer; }
+  .empty { color: var(--muted); margin-top: 2rem; }
 </style></head>
 <body>
 <h1><a href="/">Margin</a></h1>
@@ -1079,15 +1249,29 @@ _INDEX_HTML = """<!doctype html>
   <button type="submit">Save</button>
 </form>
 <div class="tabs">
-  <a href="/">Inbox ({inbox_count})</a>
-  <a href="/?view=archive">Archive ({archive_count})</a>
+  <a href="/">Inbox (__INBOX_COUNT__)</a>
+  <a href="/?view=archive">Archive (__ARCHIVE_COUNT__)</a>
 </div>
-{rows}
+<input id="filter" type="search" placeholder="Filter by title…">
+__ROWS__
+<script>
+document.getElementById('filter').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.item').forEach(function (el) {
+    el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
 </body></html>"""
 
 
 def _archive_dir() -> Path:
     return OUTPUT_DIR / _ARCHIVE_SUBDIR
+
+
+def _pretty_stem(stem: str) -> str:
+    """Fallback display title from a filename stem: drop date, de-hyphenate."""
+    return re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem).replace("-", " ") or stem
 
 
 def _read_frontmatter_field(md_path: Path, field: str) -> str | None:
@@ -1113,9 +1297,7 @@ def _list_items(folder: Path) -> list[dict]:
     for stem, files in groups.items():
         files.sort(key=lambda f: _SERVE_EXTS.index(f.suffix.lower()))
         md = next((f for f in files if f.suffix.lower() == ".md"), None)
-        title = _read_frontmatter_field(md, "title") if md else None
-        if not title:
-            title = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem).replace("-", " ") or stem
+        title = (_read_frontmatter_field(md, "title") if md else None) or _pretty_stem(stem)
         m = re.match(r"^(\d{4}-\d{2}-\d{2})", stem)
         date_str = (m.group(1) if m
                     else date.fromtimestamp(files[0].stat().st_mtime).isoformat())
@@ -1159,11 +1341,13 @@ async def index(view: str = "inbox"):
     rows = "\n".join(_item_row(i, view) for i in items) or (
         '<p class="empty">Nothing here yet.</p>'
     )
-    return HTMLResponse(_INDEX_HTML.format(
-        inbox_count=len(_list_items(OUTPUT_DIR)) if view == "archive" else len(items),
-        archive_count=len(items) if view == "archive" else len(_list_items(_archive_dir())),
-        rows=rows,
-    ))
+    inbox_n = len(_list_items(OUTPUT_DIR)) if view == "archive" else len(items)
+    archive_n = len(items) if view == "archive" else len(_list_items(_archive_dir()))
+    html = (_INDEX_HTML
+            .replace("__INBOX_COUNT__", str(inbox_n))
+            .replace("__ARCHIVE_COUNT__", str(archive_n))
+            .replace("__ROWS__", rows))
+    return HTMLResponse(html)
 
 
 @app.get("/files/{name}")

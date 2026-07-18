@@ -69,10 +69,20 @@ Shortcuts can display the message instead of failing silently.
   loaded (≤ 60 s) → network idle (best effort, ≤ 15 s) → MathJax 2/3
   typesetting finished via their JS promises/queues and
   `document.fonts.ready` (≤ 20 s) → 0.5 s settle. URLs that already point at
-  a PDF (by content type or extension, e.g. arXiv) are downloaded and stored
-  as-is. Bot-challenge interstitials ("Just a moment…") and soft-404 pages
-  are detected by title/status and reported as errors, never saved.
+  a PDF (by content type or extension) are downloaded and stored as-is, with
+  the title taken from the arXiv abstract page (for arXiv links) or the PDF's
+  embedded metadata. Bot-challenge interstitials ("Just a moment…") and
+  soft-404 pages are detected by title/status and reported as errors, never
+  saved.
 - **`md`** — additionally runs the Markdown pipeline below.
+
+Re-saving a URL that is already in the inbox or archive is skipped: the
+response carries `"duplicate": true` plus the existing files, instead of
+piling up `-2`/`-3` copies. Pass `"force": true` (or `&force=true` on
+`/save-page`) to save again anyway. Saved URLs are tracked in a
+`.saved-urls.json` index inside the output directory, with a fallback match
+on `source_url` in Markdown frontmatter for files saved before the index
+existed.
 
 ```json
 { "status": "ok", "title": "Fourier transform",
@@ -111,10 +121,11 @@ Without credentials the rest of the server works; only this endpoint errors.
 
 A minimal web UI over the output directory: every saved item with its date,
 title (from the Markdown frontmatter when available), links to its files and
-original source, a quick-save box, and an **Archive** button that moves an
-item's files into an `archive/` subfolder (with a restore view at
-`/?view=archive`). With this, any browser is a functional read-later front
-end — no notes app or third-party service required.
+original source, a quick-save box, a client-side title filter, and an
+**Archive** button that moves an item's files into an `archive/` subfolder
+(with a restore view at `/?view=archive`). Follows the system light/dark
+theme. With this, any browser is a functional read-later front end — no notes
+app or third-party service required.
 
 Supporting endpoints: `GET /files/{name}` serves saved files (inbox or
 archive; only `.pdf/.md/.tex/.org`, no path traversal), and `POST /archive`
@@ -270,6 +281,7 @@ proxy in front of it before exposing it further.
 |---|---|
 | `app.py` | FastAPI server: endpoints, math extraction, Markdown pipeline |
 | `render.py` | Playwright wrapper: rendered HTML + PDF export, wait logic |
+| `tests/` | Unit tests (`pip install -r requirements-dev.txt && python -m pytest`) |
 | `deploy/` | Ubuntu installer and systemd unit |
 | `description.md` | Architecture and the seven math-extraction strategies |
 | `shortcut_setup.md` | Step-by-step iOS Shortcut construction |
