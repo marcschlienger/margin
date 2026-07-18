@@ -1,106 +1,240 @@
 # Margin
 
 > "I have discovered a truly marvelous proof of this, which this margin is
-> too narrow to contain." — the original read-it-later note
+> too narrow to contain." — Pierre de Fermat, writing the original
+> read-it-later note, c. 1637
 
-Self-hosted read-it-later server that saves **any** web page with client-side
-rendering — including MathJax / KaTeX formulas — intact. Pages are rendered in
-headless Chromium (Playwright), which waits for JS and math typesetting to
-finish before exporting a **PDF**; a Markdown-extraction pipeline (with LaTeX
-math preserved) and Mathpix-based PDF→Markdown conversion are also available.
+Margin is a self-hosted read-it-later server. Give it a URL and it saves the
+page to a folder you control — as a pixel-faithful **PDF** rendered in headless
+Chromium, as clean **Markdown** with LaTeX math preserved, or both. It exists
+because mainstream read-later apps (Readwise Reader, Matter, Instapaper, …)
+parse the raw HTML of a page and silently strip anything rendered by
+JavaScript — most painfully MathJax and KaTeX formulas. Margin renders the real
+page first and captures it only after the JS, the math typesetting, and the web
+fonts have finished.
 
-Why: mainstream read-later apps (Readwise Reader, Matter, Instapaper) parse the
-raw HTML and strip JS-rendered math. Rendering the real page first sidesteps
-that entirely.
+It is a single small FastAPI app designed for personal use: run it on a Mac or
+an Ubuntu server, point an iOS Shortcut, `curl`, or any HTTP client at it, and
+collect the results in a synced folder (iCloud → Obsidian, Nextcloud, Syncthing
+— anything that watches a directory).
 
-## Endpoints
+## How it works
 
-| Endpoint | Input | Output |
-|---|---|---|
-| `POST /save` | `{"url": "…", "formats": ["pdf", "md"]}` (formats optional, default `["pdf"]`) | Renders the page in headless Chromium, saves `YYYY-MM-DD-title-slug.pdf`; `"md"` additionally runs the Markdown pipeline. URLs that point directly at a PDF are stored as-is. |
-| `POST /save-url` | `{"url": "…"}` | Markdown pipeline only: extracts article + math to `.md` (+ `.tex`/`.org` via Pandoc). Falls back to headless rendering when the page is client-side rendered or the plain fetch is blocked. |
-| `POST /save-pdf` | multipart form, field `file` | PDF → Markdown via the Mathpix OCR API (needs `MATHPIX_*` credentials). |
-| `GET /health` | – | Status: output dir, Pandoc/Playwright/Mathpix availability, saved-file counts. |
-| `POST /echo` | anything | Debug: echoes the request back. |
-
-Save responses are always HTTP 200 with `{"status": "ok"|"error", …}` so iOS
-Shortcuts can surface the message. Example:
-
-```bash
-curl -X POST http://localhost:8000/save \
-  -H 'Content-Type: application/json' \
-  -d '{"url": "https://en.wikipedia.org/wiki/Fourier_transform", "formats": ["pdf", "md"]}'
+```
+ iPhone Share Sheet / curl / RSS reader
+        │  HTTP POST (LAN or Tailscale)
+        ▼
+ ┌─────────────────────── Margin (FastAPI, port 8000) ───────────────────────┐
+ │                                                                           │
+ │  POST /save ──► headless Chromium (Playwright)                            │
+ │                   goto → network idle → MathJax/KaTeX done → fonts ready  │
+ │                   └─► page.pdf()  ──────────────────────────►  .pdf       │
+ │                                                                           │
+ │  POST /save-url ─► fetch HTML ─► math extraction ─► trafilatura ─► .md    │
+ │                    (falls back to the Chromium DOM     + .tex/.org        │
+ │                     for SPAs and bot-walled fetches)   via Pandoc         │
+ │                                                                           │
+ │  POST /save-pdf ─► Mathpix OCR API ─► Mathpix Markdown ─►  .md            │
+ │                                                                           │
+ └────────────────────────────► OUTPUT_DIR ◄────────────────────────────────┘
+                    (e.g. an iCloud/Nextcloud folder synced to your notes app)
 ```
 
-## Output directory
+The PDF path is the general-purpose one: it works on any page, including
+client-side-rendered SPAs, and preserves exactly what a browser shows. The
+Markdown path is the "clean text for my notes app" one: it extracts the
+article body and converts every math representation it finds back to LaTeX
+source (`$...$` / `$$...$$`), covering Wikipedia/MediaWiki annotations,
+MathJax 2 script tags, MathJax 3 rendered containers (recovered from assistive
+MathML), KaTeX annotations, raw presentation MathML (converted structurally),
+`alt`-text formula images, and stray Unicode math in prose. The strategies are
+documented in detail in [description.md](description.md).
 
-Priority: `--output-dir` flag → `OUTPUT_DIR` env var (also read from `.env`) →
-platform default (`~/Library/Mobile Documents/com~apple~CloudDocs/ReadLater/inbox`
-on macOS for the iCloud→Obsidian workflow, `~/ReadLater/inbox` elsewhere).
+## API
 
-## Quickstart (local)
+All save endpoints respond with HTTP 200 and a JSON body containing
+`"status": "ok"` or `"status": "error"` — errors are in-band so that iOS
+Shortcuts can display the message instead of failing silently.
+
+### `POST /save` — save any page (the general endpoint)
+
+```json
+{ "url": "https://…", "formats": ["pdf", "md"] }
+```
+
+`formats` is optional and defaults to `["pdf"]`.
+
+- **`pdf`** — renders the page in headless Chromium and exports A4 PDF with
+  screen CSS and backgrounds. The renderer waits, in order: DOM content
+  loaded (≤ 60 s) → network idle (best effort, ≤ 15 s) → MathJax 2/3
+  typesetting finished via their JS promises/queues and
+  `document.fonts.ready` (≤ 20 s) → 0.5 s settle. URLs that already point at
+  a PDF (by content type or extension, e.g. arXiv) are downloaded and stored
+  as-is. Bot-challenge interstitials ("Just a moment…") and soft-404 pages
+  are detected by title/status and reported as errors, never saved.
+- **`md`** — additionally runs the Markdown pipeline below.
+
+```json
+{ "status": "ok", "title": "Fourier transform",
+  "files": ["2026-07-18-fourier-transform.pdf", "2026-07-18-fourier-transform.md"],
+  "path": "/var/lib/margin/inbox" }
+```
+
+On partial success a `"warnings"` array lists what failed; on total failure
+`"status": "error"` with a `"message"`.
+
+### `POST /save-url` — Markdown pipeline
+
+```json
+{ "url": "https://…" }
+```
+
+Fetches the raw HTML (fast — MathJax/KaTeX sites ship the LaTeX source in the
+initial HTML), extracts the article with math converted to LaTeX, and writes
+`.md` plus companion `.tex` and `.org` files (via Pandoc, if installed). If
+the plain fetch is bot-blocked (401/403/406/429/503) or the extracted body is
+nearly empty (client-side-rendered app), it automatically retries from the
+fully rendered Chromium DOM. Responds with
+`{"status": "ok", "filename": …, "title": …, "path": …}`.
+
+The URL cleaning tolerates iOS Shortcuts quirks (inserted whitespace,
+duplicated URL); only `http(s)` URLs are accepted.
+
+### `POST /save-pdf` — PDF upload → Markdown
+
+Multipart form upload, field `file`, ≤ 50 MB. Converts via the
+[Mathpix](https://mathpix.com) `/v3/pdf` OCR API (polls up to 3 minutes) —
+best-in-class for math PDFs, requires `MATHPIX_APP_ID`/`MATHPIX_APP_KEY`.
+Without credentials the rest of the server works; only this endpoint errors.
+
+### `GET /health`
+
+```json
+{ "status": "ok", "output_dir": "…", "output_dir_exists": true,
+  "output_dir_writable": true, "saved_md_count": 12, "saved_pdf_count": 34,
+  "pandoc_available": true, "playwright_available": true,
+  "mathpix_configured": false }
+```
+
+### `POST /echo`
+
+Debug helper: echoes method, headers, and parsed body of the request back.
+
+## Saved files
+
+- Filenames: `YYYY-MM-DD-title-slug.{pdf,md,tex,org}`. Titles come from the
+  page `<title>`/`og:title` (site-name suffixes like `… | Site` stripped);
+  name collisions get `-2`, `-3`, … suffixes — nothing is ever overwritten.
+- Markdown files start with YAML frontmatter:
+
+  ```markdown
+  ---
+  title: "Understanding the Fourier Transform"
+  source_url: "https://example.com/fourier"
+  date_saved: 2026-07-18
+  tags: [readlater, math]
+  ---
+  ```
+
+  (the `math` tag only appears when the page actually contains math). Math
+  uses `$...$` / `$$...$$`, which Obsidian renders natively.
+- `.tex` companions are minimal, self-contained `pdflatex`-compilable articles;
+  `.org` companions are for Emacs Org-mode. Both are derived from the `.md`
+  via Pandoc and skipped gracefully when Pandoc is absent.
+
+## Configuration
+
+| Setting | How | Default |
+|---|---|---|
+| Output directory | `--output-dir` flag > `OUTPUT_DIR` env var (both also read from `.env`) | iCloud `ReadLater/inbox` on macOS, `~/ReadLater/inbox` elsewhere |
+| Bind address / port | `--host` / `--port` flags, or `HOST` / `PORT` env vars | `0.0.0.0` / `8000` |
+| Mathpix credentials | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` in `.env` | unset — `/save-pdf` disabled |
+
+## Install
+
+Requirements: Python ≥ 3.10. Optional: `pandoc` (for `.tex`/`.org`
+companions), Mathpix credentials (for `/save-pdf`).
+
+### Local / macOS
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+git clone https://codeberg.org/blutlauge/margin.git && cd margin
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium        # headless browser for /save
-cp .env.example .env               # optional: OUTPUT_DIR, Mathpix credentials
+playwright install chromium          # headless browser for /save
+cp .env.example .env                 # optional: OUTPUT_DIR, Mathpix keys
 
-python app.py --output-dir ~/ReadLater/inbox   # defaults: 0.0.0.0:8000
+python app.py --output-dir ~/ReadLater/inbox
 curl http://localhost:8000/health
 ```
 
-`pandoc` on the PATH is optional — it adds companion `.tex`/`.org` files to
-every Markdown save. Without Playwright the server still runs; `/save` (PDF)
-returns an error and `/save-url` loses its rendered-page fallback.
+Without Playwright installed the server still runs: `/save` (PDF) returns an
+instructive error and `/save-url` loses only its rendered-DOM fallback.
 
-## Deploy on Ubuntu (systemd)
+For auto-start at login on macOS, `start.sh` is a launchd-friendly wrapper
+(see the LaunchAgent notes in [description.md](description.md)).
 
-On the server, from a checkout of this repo:
+### Ubuntu server (systemd)
+
+From a checkout on the server:
 
 ```bash
 sudo bash deploy/install.sh
 ```
 
-This installs the app to `/opt/margin`, creates a `margin` system user, sets
-up the venv, installs headless Chromium with its system dependencies, writes
-files to `/var/lib/margin/inbox`, and enables the `margin` systemd service.
-Customize via env vars:
+The installer is idempotent and: installs `python3-venv`/`pandoc`, creates a
+`margin` system user, copies the app to `/opt/margin`, builds the venv,
+installs headless Chromium **with its system dependencies**, writes output to
+`/var/lib/margin/inbox`, and enables the `margin` systemd service
+([deploy/margin.service](deploy/margin.service)). Defaults are overridable:
 
 ```bash
-sudo APP_DIR=/opt/margin OUTPUT_DIR=/srv/margin/inbox bash deploy/install.sh
+sudo APP_DIR=/opt/margin OUTPUT_DIR=/srv/margin/inbox SERVICE_USER=margin \
+  bash deploy/install.sh
 ```
 
-Operate it with:
+Day-2 operations:
 
 ```bash
 systemctl status margin
 journalctl -u margin -f
-curl http://localhost:8000/health
+sudo systemctl restart margin        # e.g. after editing /opt/margin/.env
 ```
 
-Edit `/opt/margin/.env` for Mathpix credentials, then
-`sudo systemctl restart margin`. The unit file lives at
-[deploy/margin.service](deploy/margin.service).
+The service listens on all interfaces without authentication — run it on a
+private network (LAN, Tailscale, WireGuard) or put an authenticating reverse
+proxy in front of it before exposing it further.
 
-## macOS auto-start (legacy iCloud workflow)
+## Capture clients
 
-```bash
-launchctl load ~/Library/LaunchAgents/com.marc.math-readlater.plist
-```
+- **iOS Share Sheet** — two small Shortcuts (URL → `/save-url`, PDF →
+  `/save-pdf`); build instructions in [shortcut_setup.md](shortcut_setup.md).
+- **Anything that speaks HTTP** — `curl`, RSS-reader automations, Raycast, a
+  cron job:
 
-If launchd reports a permission error on `.venv/pyvenv.cfg`, grant Full Disk
-Access to `/bin/bash` in System Settings → Privacy & Security.
+  ```bash
+  curl -X POST http://server:8000/save \
+    -H 'Content-Type: application/json' \
+    -d '{"url": "https://en.wikipedia.org/wiki/Fourier_transform"}'
+  ```
 
-## Day-to-day use
+## Limitations & roadmap
 
-- iPhone → Share Sheet → **Math Inbox — URL** / **Math Inbox — PDF** shortcuts
-  (see [shortcut_setup.md](shortcut_setup.md)); they POST to `/save-url` and
-  `/save-pdf`.
-- Bookmarklet / browser extension: `POST /save` with the current tab's URL.
-- Failed saves return the error message in the response body; server logs go
-  to stderr (journald on Ubuntu, `server.log` under launchd).
+- Sites behind aggressive bot protection (e.g. Cloudflare-challenged domains)
+  may refuse the headless browser; Margin detects this and returns a clear
+  error instead of saving the challenge page. Workaround: print the page to
+  PDF on-device and use `/save-pdf`.
+- No authentication and no CORS headers yet — a browser bookmarklet would need
+  a small CORS middleware; planned.
+- Planned: optional upload of saved PDFs to Readwise Reader via its API.
 
-For architecture and the math-extraction strategies, see
-[description.md](description.md).
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `app.py` | FastAPI server: endpoints, math extraction, Markdown pipeline |
+| `render.py` | Playwright wrapper: rendered HTML + PDF export, wait logic |
+| `deploy/` | Ubuntu installer and systemd unit |
+| `description.md` | Architecture and the seven math-extraction strategies |
+| `shortcut_setup.md` | Step-by-step iOS Shortcut construction |
+| `start.sh` | launchd-friendly start wrapper (macOS) |
