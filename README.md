@@ -383,7 +383,8 @@ Tailscale, WireGuard) and/or set `MARGIN_TOKEN` — see
 | `app.py` | FastAPI server: endpoints, math extraction, Markdown pipeline |
 | `render.py` | Playwright wrapper: rendered HTML + PDF export, wait logic |
 | `tests/` | Unit tests (`pip install -r requirements-dev.txt && python -m pytest`) |
-| `deploy/` | Ubuntu installer and systemd unit |
+| `deploy/` | Ubuntu installer, systemd unit, icon regeneration script |
+| `static/` | App icon (SVG master + generated PNGs) and web manifest |
 | `description.md` | Architecture and the seven math-extraction strategies |
 | `shortcut_setup.md` | Step-by-step iOS Shortcut construction |
 | `start.sh` | launchd-friendly start wrapper (macOS) |
