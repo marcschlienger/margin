@@ -16,25 +16,33 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 REPO = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent
-SIZES = [(180, "apple-touch-icon.png"), (512, "icon-512.png")]
+
+# (size, filename, rounded) — square/full-bleed for touch icons (platforms
+# mask their own corners); rounded + transparent corners for tab favicons.
+SIZES = [
+    (180, "apple-touch-icon.png", False),
+    (512, "icon-512.png", False),
+    (32, "favicon-32.png", True),
+]
 
 svg = (REPO / "static" / "icon.svg").read_text(encoding="utf-8")
 svg_square = re.sub(r'rx="14"', 'rx="0"', svg)
 
 with sync_playwright() as p:
     browser = p.chromium.launch()
-    for size, name in SIZES:
+    for size, name, rounded in SIZES:
         page = browser.new_page(viewport={"width": size, "height": size})
         page.set_content(
-            f"<body style='margin:0'>"
-            f"<div style='width:{size}px;height:{size}px'>{svg_square}</div>"
-            f"</body>"
+            f"<body style='margin:0;background:transparent'>"
+            f"<div style='width:{size}px;height:{size}px'>"
+            f"{svg if rounded else svg_square}</div></body>"
         )
         page.locator("svg").evaluate(
             "el => { el.setAttribute('width','100%'); el.setAttribute('height','100%'); }"
         )
         page.screenshot(path=str(REPO / "static" / name),
-                        clip={"x": 0, "y": 0, "width": size, "height": size})
+                        clip={"x": 0, "y": 0, "width": size, "height": size},
+                        omit_background=rounded)
         page.close()
         print(f"wrote static/{name} ({size}x{size})")
     browser.close()

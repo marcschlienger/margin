@@ -127,6 +127,7 @@ _PUBLIC_PATHS = {
     "/health",
     "/favicon.svg",
     "/favicon.ico",
+    "/favicon-32.png",
     "/apple-touch-icon.png",
     "/manifest.json",
 }
@@ -1221,15 +1222,23 @@ async def save_pdf(file: UploadFile = File(...)):
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+# SVG first for browsers that support it; 32px PNG fallback for Safari,
+# which ignores SVG favicons.
 _HEAD_ICONS = """<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="manifest" href="/manifest.json">"""
 
 
 @app.get("/favicon.svg", include_in_schema=False)
-@app.get("/favicon.ico", include_in_schema=False)  # served as SVG; browsers go by content type
-async def favicon():
+async def favicon_svg():
     return FileResponse(_STATIC_DIR / "icon.svg", media_type="image/svg+xml")
+
+
+@app.get("/favicon-32.png", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)  # PNG content; browsers go by content type
+async def favicon_png():
+    return FileResponse(_STATIC_DIR / "favicon-32.png", media_type="image/png")
 
 
 @app.get("/apple-touch-icon.png", include_in_schema=False)

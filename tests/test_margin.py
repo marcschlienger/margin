@@ -236,6 +236,8 @@ def test_icons_public_even_with_token(monkeypatch, tmp_path):
     client = TestClient(app.app)
     for path, ctype in [
         ("/favicon.svg", "image/svg+xml"),
+        ("/favicon.ico", "image/png"),  # PNG fallback for Safari
+        ("/favicon-32.png", "image/png"),
         ("/apple-touch-icon.png", "image/png"),
         ("/static/icon-512.png", "image/png"),
         ("/manifest.json", "application/manifest+json"),
