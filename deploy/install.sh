@@ -51,12 +51,13 @@ echo "==> Installing headless Chromium (+ system dependencies) for Playwright"
 sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/playwright" install chromium
 
 echo "==> Setting ownership"
-chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR" "$(dirname "$OUTPUT_DIR")"
+# Only the app dir and the output dir itself — never the output dir's parent,
+# which may hold unrelated services' data.
+chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR" "$OUTPUT_DIR"
 
 echo "==> Installing systemd unit"
-sed -e "s|/opt/margin|$APP_DIR|g" \
-    -e "s|/var/lib/margin/inbox|$OUTPUT_DIR|g" \
-    -e "s|ReadWritePaths=/var/lib/margin|ReadWritePaths=$(dirname "$OUTPUT_DIR")|" \
+sed -e "s|/var/lib/margin/inbox|$OUTPUT_DIR|g" \
+    -e "s|/opt/margin|$APP_DIR|g" \
     -e "s|^User=.*|User=$SERVICE_USER|" \
     -e "s|^Group=.*|Group=$SERVICE_USER|" \
     "$REPO_DIR/deploy/margin.service" \

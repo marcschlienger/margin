@@ -18,29 +18,29 @@ JS/MathJax/KaTeX typesetting to finish, and exports a pixel-faithful PDF;
 ## Architecture
 
 ```
-iPhone / iPad
-  Share Sheet
+iPhone Share Sheet / desktop bookmarklet / curl
       │
-      │  HTTP POST (Tailscale or local Wi-Fi)
+      │  HTTP (Tailscale or local network)
       ▼
-Mac — FastAPI server (port 8000)
+Margin — FastAPI server, port 8000  (Ubuntu, macOS, or any Linux)
       │
-      ├── /save-url ──► fetch HTML ──► extract content + math ──► .md
+      ├── /save     ──► headless Chromium ──► JS+math rendered ──► .pdf
+      ├── /save-url ──► fetch HTML ──► extract content + math ──► .md (+.tex/.org)
+      ├── /save-pdf ──► Mathpix API ──► poll for MMD ──► .md
       │
-      └── /save-pdf ──► Mathpix API ──► poll for MMD ──► .md
-                                                              │
-                                                              ▼
-                                              iCloud Drive / ReadLater / inbox /
-                                                              │
-                                                              ▼
-                                                         Obsidian vault
+      └── /  (reading queue UI: list, read, archive)
+                                              │
+                                              ▼
+                                        OUTPUT_DIR
+                          (a plain folder — sync it with iCloud,
+                           Nextcloud, or Syncthing, or read via /)
 ```
 
-The server runs as a macOS Launch Agent
-(`~/Library/LaunchAgents/com.marc.math-readlater.plist`) so it starts automatically
-at login and restarts on crash. iOS triggers it via two Apple Shortcuts — one for
-URLs, one for PDFs — each posting to the server over Tailscale (works from anywhere)
-or local Wi-Fi.
+On Ubuntu the server runs as a systemd service (`deploy/margin.service`,
+installed by `deploy/install.sh`); on macOS it can run as a Launch Agent so it
+starts at login and restarts on crash. Capture happens from iOS via two Apple
+Shortcuts (one for URLs, one for PDFs), from desktop browsers via a
+bookmarklet hitting `/save-page`, or from anything that can POST JSON.
 
 ---
 
@@ -55,9 +55,10 @@ or local Wi-Fi.
 | `requirements.txt` | Python dependencies |
 | `.env` | Mathpix credentials (`MATHPIX_APP_ID`, `MATHPIX_APP_KEY`) |
 | `.env.example` | Template for `.env` — copy to `.env` and fill in |
-| `start.sh` | Shell wrapper used by launchctl to activate the venv |
+| `start.sh` | Start wrapper (used by the macOS Launch Agent; runs `app.py`) |
 | `shortcut_setup.md` | Step-by-step instructions for building the iOS Shortcuts |
-| `~/Library/LaunchAgents/com.marc.math-readlater.plist` | Launch Agent definition |
+| `LICENSE` | GNU AGPL v3.0 |
+| `~/Library/LaunchAgents/…plist` | Launch Agent definition (macOS auto-start only; not in the repo) |
 
 ### Setting up Mathpix credentials
 
@@ -147,6 +148,28 @@ a notification. (HTTP 4xx/5xx would otherwise abort the Shortcut silently.)
 
 **Returns:** same shape as `/save-url` — `{"status":"ok",…}` on success, or
 `{"status":"error","filename":"","message":"..."}` on any failure.
+
+---
+
+### `GET /save-page`
+
+Bookmarklet-facing variant of `POST /save`: query parameters
+(`?url=…&formats=pdf,md`) instead of JSON, and an HTML result page instead of
+a JSON body. Desktop bookmarklets open it in a new tab because browsers block
+`fetch()` from https pages to a plain-http LAN server (mixed content), while
+top-level navigation is always allowed. The tab closes itself on success.
+
+---
+
+### `GET /` — reading queue
+
+Lists every saved item in the output directory: date, title (from Markdown
+frontmatter when present), links to each file and the original source, a
+quick-save form, and per-item Archive buttons. `/?view=archive` shows archived
+items with Restore buttons. Supporting endpoints: `GET /files/{name}` serves
+saved files (`.pdf/.md/.tex/.org` only, traversal-safe), and `POST /archive`
+(form fields `stem`, `action=archive|restore`) moves an item's files between
+the output directory and its `archive/` subfolder.
 
 ---
 
@@ -243,6 +266,18 @@ alongside the rendered MathML. The pipeline extracts this, strips the
 `{\displaystyle ...}` wrapper that Wikipedia adds to every formula, and replaces
 the entire span with `$LATEX$` (inline) or `$$LATEX$$` (display).
 
+### Strategy 1b — MathJax 3 rendered output
+**Markup:** `<mjx-container>` elements produced by client-side MathJax 3
+typesetting, containing an assistive-MathML copy (`<mjx-assistive-mml>`).
+
+Relevant when extracting from the *rendered* DOM (the headless-Chromium
+fallback): after MathJax 3 has typeset a page, the original TeX is no longer
+present as text. The pipeline recovers it from the assistive MathML inside the
+container — preferring an embedded `x-tex` annotation, then `alttext`, then
+structural MathML→LaTeX conversion — and replaces the whole container
+(including its SVG/CHTML rendering) with the LaTeX. Runs before Strategy 2 so
+the generic `<math>` pass doesn't leave duplicate renderings behind.
+
 ### Strategy 2 — General MathML (with embedded LaTeX)
 **Markup:** `<math>` element with `<annotation encoding="application/x-tex">` or
 `alttext` attribute.
@@ -318,29 +353,25 @@ footers, and outputs Markdown with headings, bold, italic, and lists preserved.
 
 ## iOS Shortcuts
 
-Two pairs of shortcuts are provided (see `shortcut_setup.md` for full build
-instructions):
+Two shortcuts connect the iOS Share Sheet to the server (see
+`shortcut_setup.md` for full build instructions). Each is a thin client: it
+POSTs the URL or PDF to the server — wherever it runs — and shows a
+notification with the saved filename. All conversion logic stays server-side.
 
-**Option B — companion shortcuts (recommended)**
-Requires the Mac server to be running. Each shortcut is a thin client: it POSTs
-the URL or PDF to the server and shows a notification with the saved filename.
-All conversion logic runs on the Mac.
-
-- `Margin — URL`: Share Sheet type = URLs. POSTs `{"url": "..."}` to
-  `/save-url` with `Accept: application/json` header.
-- `Margin — PDF`: Share Sheet type = PDFs. POSTs the file as multipart form
-  data to `/save-pdf`.
+- **Save to Margin**: Share Sheet type = URLs. POSTs `{"url": "..."}` to
+  `/save-url` with an `Accept: application/json` header.
+- **Save PDF to Margin**: Share Sheet type = PDFs. POSTs the file as multipart
+  form data to `/save-pdf`.
 
 Both include an explicit "Get Dictionary from Input" step before "Get Dictionary
 Value" to prevent the *"couldn't convert from Text to Dictionary"* error that
 occurs when Shortcuts receives a JSON response but hasn't been told to parse it.
 
-**Option A — standalone shortcuts (no server required)**
-Call the Mathpix API directly from iOS. Credentials are stored as plain-text
-variables in the shortcut. PDFs go through the same Mathpix polling flow as the
-server. URL conversion uses Mathpix `/v3/text` (OCR-based, weaker than the
-server-side HTML extraction for MathJax/KaTeX pages). A polling loop of 20 × 5 s
-gives a 100-second timeout; large PDFs should use Option B instead.
+`shortcut_setup.md` also has an appendix with standalone variants ("… (no
+server)") that call the Mathpix API directly from iOS — a fallback for when no
+server is reachable. They are weaker (OCR-based URL conversion, 100 s PDF
+timeout, plain-text credentials inside the shortcut) and only worth building
+if you cannot run the server.
 
 ---
 
@@ -356,29 +387,30 @@ gives a 100-second timeout; large PDFs should use Option B instead.
 | `python-dotenv` | Load `.env` credentials |
 | `python-multipart` | Multipart form parsing for PDF upload |
 | `pydantic` | Request validation and URL sanitisation |
+| `playwright` | Headless Chromium: page rendering and PDF export |
 
 ---
 
 ## Running the Server
 
-**Start manually:**
+**Start manually** (any platform):
 ```bash
-cd ~/Documents/math-readlater
-source .venv/bin/activate
-uvicorn app:app --host 0.0.0.0 --port 8000
+.venv/bin/python app.py --host 0.0.0.0 --port 8000 [--output-dir DIR]
 ```
 
-**Start via Launch Agent (auto-starts at login):**
+**Ubuntu — systemd service** (installed by `deploy/install.sh`):
+```bash
+systemctl status margin
+journalctl -u margin -f          # logs
+```
+
+**macOS — Launch Agent (auto-starts at login):**
 ```bash
 launchctl load ~/Library/LaunchAgents/com.marc.math-readlater.plist
+tail -f server.log               # logs, in the app directory
 ```
 
-**Check logs:**
-```bash
-tail -f ~/Documents/math-readlater/server.log
-```
-
-**Convert a saved Markdown file to PDF** (requires Pandoc + BasiTeX):
+**Convert a saved Markdown file to PDF** (requires Pandoc + BasicTeX or TeX Live):
 ```bash
 pandoc input.md -o output.pdf --pdf-engine=xelatex -V geometry:margin=1in
 ```

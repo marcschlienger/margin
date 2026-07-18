@@ -11,9 +11,12 @@
 """Margin — read-later server that saves web pages with JS/math rendering intact.
 
 POST /save       { "url": "https://...", "formats": ["pdf", "md"] }
-POST /save-url   { "url": "https://..." }   Markdown pipeline (legacy alias)
-POST /save-pdf   multipart form, field "file"
-GET  /health
+POST /save-url   { "url": "https://..." }   Markdown pipeline only
+POST /save-pdf   multipart form, field "file" (Mathpix OCR → Markdown)
+GET  /save-page  ?url=…&formats=pdf,md      bookmarklet target, HTML result
+GET  /           reading queue UI  (with GET /files/{name}, POST /archive)
+GET  /health     status and configuration check
+POST /echo       debug: mirrors the request back
 
 Output directory: --output-dir flag > OUTPUT_DIR env var > platform default.
 """
@@ -767,6 +770,10 @@ def _log(label: str, msg: str) -> None:
 _THIN_BODY_CHARS = 200
 
 
+# Cap for PDFs downloaded from a URL (uploads have their own MAX_PDF_BYTES).
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+
+
 async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
     """Return the raw bytes if `url` serves a PDF directly, else None."""
     ctype = ""
@@ -778,13 +785,21 @@ async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
     if "application/pdf" not in ctype and not urlparse(url).path.lower().endswith(".pdf"):
         return None
     try:
-        resp = await client.get(url)
-        resp.raise_for_status()
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            if "application/pdf" not in resp.headers.get("content-type", "").lower():
+                return None
+            chunks, size = [], 0
+            async for chunk in resp.aiter_bytes():
+                size += len(chunk)
+                if size > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError(
+                        f"PDF at {url} exceeds {MAX_DOWNLOAD_BYTES // 2**20} MB"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
     except httpx.HTTPError:
         return None
-    if "application/pdf" not in resp.headers.get("content-type", "").lower():
-        return None
-    return resp.content
 
 
 def _write_binary(filename: str, data: bytes) -> Path:
@@ -929,7 +944,7 @@ async def save(payload: SavePayload, request: Request):
 
 @app.post("/save-pdf")
 async def save_pdf(file: UploadFile = File(...)):
-    """Convert PDF via Mathpix, save resulting Markdown to iCloud inbox."""
+    """Convert PDF via Mathpix, save the resulting Markdown to the output dir."""
     _log("save-pdf", f"received {file.filename}")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         return _err("Expected a .pdf file")

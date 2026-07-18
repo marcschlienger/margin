@@ -1,5 +1,9 @@
 # Apple Shortcuts Setup
 
+Two iOS Shortcuts connect the Share Sheet to your Margin server — one for
+URLs, one for PDFs. The server can run anywhere reachable from the phone:
+a Mac on your network, an Ubuntu server, or any machine over Tailscale.
+
 > **Why two shortcuts instead of one?**
 > Shortcuts cannot reliably branch on whether the input is a URL vs a file — the
 > `If … is URL` condition is inconsistent across share sources (Safari, RSS readers,
@@ -7,40 +11,40 @@
 > handles. iOS shows each shortcut only when the Share Sheet input matches its
 > declared type, so the right one always appears.
 
-Four shortcuts are described here (Option B recommended):
-
-| Name | Accepts | Requires server? |
+| Name | Accepts | Talks to |
 |---|---|---|
-| **Margin — URL** | URLs | Yes (Option B) |
-| **Margin — PDF** | PDF files | Yes (Option B) |
-| **Margin — URL (standalone)** | URLs | No (Option A) |
-| **Margin — PDF (standalone)** | PDF files | No (Option A) |
+| **Save to Margin** | URLs | your Margin server (recommended) |
+| **Save PDF to Margin** | PDF files | your Margin server (recommended) |
+| **Save to Margin (no server)** | URLs | Mathpix API directly — see appendix |
+| **Save PDF to Margin (no server)** | PDF files | Mathpix API directly — see appendix |
+
+The server shortcuts are thin clients: they POST the URL or file to Margin and
+show a notification with the result. All conversion logic stays server-side.
+The "no server" variants in the appendix call the Mathpix API straight from
+iOS and are only worth building if you can't run the server at all.
 
 ---
 
-## Option B — Two companion shortcuts  *(recommended)*
+## Prerequisites
 
-The shortcuts POST to the Mac server and show a notification. All conversion logic
-stays server-side.
-
-### Prerequisites
-
-- The Mac server is running: `launchctl start com.marc.math-readlater`
-- Confirm it is up: `curl http://localhost:8000/health`
-- Find your Mac's IP for the shortcut URL:
-  - Same Wi-Fi → System Settings → Network → your interface → IP address,
-    e.g. `http://192.168.1.42:8000`
-  - Away from home → install [Tailscale](https://tailscale.com) on both devices;
-    use the Tailscale IP shown in the menu bar app, e.g. `http://100.x.y.z:8000`
+- The Margin server is running and reachable:
+  - **Ubuntu**: `systemctl status margin` on the server
+  - **macOS**: started via `bash start.sh` or its Launch Agent
+  - From any machine: `curl http://SERVER_ADDRESS:8000/health` returns JSON
+- Find the server address to put into the shortcuts:
+  - Same Wi-Fi / LAN → the server machine's local IP, e.g.
+    `http://192.168.1.42:8000`
+  - Away from home → install [Tailscale](https://tailscale.com) on the phone
+    and the server; use the server's Tailscale IP, e.g. `http://100.x.y.z:8000`
 
 ---
 
-### Shortcut 1 of 2 — "Margin — URL"
+## Shortcut 1 of 2 — "Save to Margin"
 
 **Step 1 — Create and configure**
 
 1. Open the **Shortcuts** app → tap **+** (top right).
-2. Tap the title field at the top → type **Margin — URL** → tap **Done**.
+2. Tap the title field at the top → type **Save to Margin** → tap **Done**.
 3. Tap **ⓘ** (bottom right) → turn on **Show in Share Sheet**.
 4. Tap **Share Sheet Types** → deselect everything except **URLs** → tap **Done**.
 5. Tap **Done** to close the details panel.
@@ -49,7 +53,7 @@ stays server-side.
 
 6. Tap **Add Action** → search for **Get Contents of URL** → tap it.
 7. Tap the blue **URL** field in the action → type your server address:
-   `http://YOUR_MAC_IP:8000/save-url`
+   `http://SERVER_ADDRESS:8000/save-url`
 8. Tap **Show More** (below the URL field) to expand the options.
 9. Set **Method** to **POST**.
 10. Set **Request Body** to **JSON**.
@@ -93,12 +97,12 @@ stays server-side.
 
 ---
 
-### Shortcut 2 of 2 — "Margin — PDF"
+## Shortcut 2 of 2 — "Save PDF to Margin"
 
 **Step 1 — Create and configure**
 
 1. Open **Shortcuts** → tap **+**.
-2. Name it **Margin — PDF**.
+2. Name it **Save PDF to Margin**.
 3. Tap **ⓘ** → turn on **Show in Share Sheet**.
 4. Tap **Share Sheet Types** → deselect everything except **PDFs** → tap **Done**.
 5. Tap **Done** to close the details panel.
@@ -106,7 +110,7 @@ stays server-side.
 **Step 2 — Add the request action**
 
 6. Tap **Add Action** → **Get Contents of URL**.
-7. URL field: `http://YOUR_MAC_IP:8000/save-pdf`
+7. URL field: `http://SERVER_ADDRESS:8000/save-pdf`
 8. Tap **Show More**.
 9. Set **Method** to **POST**.
 10. Set **Request Body** to **Form** (not JSON — this sends multipart/form-data,
@@ -139,28 +143,31 @@ stays server-side.
 
 ---
 
-### Using the shortcuts
+## Using the shortcuts
 
 | Share source | What to share | Which shortcut appears |
 |---|---|---|
-| Safari | current page URL | Margin — URL |
-| NetNewsWire / Unread | article link | Margin — URL |
-| Files app | a PDF file | Margin — PDF |
-| Safari | a PDF opened in browser | Margin — PDF |
+| Safari | current page URL | Save to Margin |
+| NetNewsWire / Unread | article link | Save to Margin |
+| Files app | a PDF file | Save PDF to Margin |
+| Safari | a PDF opened in browser | Save PDF to Margin |
 
 ---
 
-### Troubleshooting
+## Troubleshooting
 
 **"Get Dictionary from Input" still fails**
 The server returned something other than JSON (an error page, or no response).
-Check the server log on your Mac:
+Check the server logs:
+
 ```bash
-tail -30 ~/Documents/math-readlater/server.log
+journalctl -u margin -n 30        # Ubuntu (systemd)
+tail -30 server.log               # macOS (in the app directory, when launchd-run)
 ```
+
 Also verify the server is running:
 ```bash
-curl http://localhost:8000/health
+curl http://SERVER_ADDRESS:8000/health
 ```
 
 **Debugging with `/echo`**
@@ -171,10 +178,12 @@ the notification — it will show the exact request the server got. Swap back to
 
 ---
 
-## Option A — Two standalone shortcuts  *(no server required)*
+## Appendix — standalone shortcuts (no server, Mathpix direct)
 
-These call the Mathpix API directly from iOS. Credentials are stored as plain text
-inside the shortcut — do not share the shortcut file.
+These call the Mathpix API directly from iOS and write the result to iCloud
+Drive; no Margin server involved. They exist as a fallback and are weaker than
+the server pipeline (OCR-based URL conversion, 100 s PDF timeout). Credentials
+are stored as plain text inside the shortcut — do not share the shortcut file.
 
 ### Shared credential variables (add these at the top of both shortcuts)
 
@@ -183,9 +192,7 @@ inside the shortcut — do not share the shortcut file.
 2. **Add Action** → **Text** → paste your Mathpix `app_key` → rename result `MX_KEY`.
 3. **Add Action** → **Text** → type `ReadLater/inbox` → rename result `INBOX_FOLDER`.
 
----
-
-### Shortcut A1 — "Margin — URL (standalone)"
+### "Save to Margin (no server)" — URLs
 
 Share Sheet Types: **URLs only**
 
@@ -247,9 +254,7 @@ After the three credential actions:
 
 12. Tap **Done**.
 
----
-
-### Shortcut A2 — "Margin — PDF (standalone)"
+### "Save PDF to Margin (no server)" — PDFs
 
 Share Sheet Types: **PDFs only**
 
@@ -333,7 +338,7 @@ After the three credential actions:
 19. Tap **Done**.
 
 > **Limitation:** The polling loop runs for up to 100 s (20 × 5 s). PDFs over
-> ~50 pages may exceed this — use the Option B server shortcut for those.
+> ~50 pages may exceed this — use the server shortcut for those.
 
 ---
 

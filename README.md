@@ -226,8 +226,8 @@ proxy in front of it before exposing it further.
 
 ## Capture clients
 
-- **iOS Share Sheet** — two small Shortcuts ("Margin — URL" → `/save-url`,
-  "Margin — PDF" → `/save-pdf`); build instructions in
+- **iOS Share Sheet** — two small Shortcuts ("Save to Margin" → `/save-url`,
+  "Save PDF to Margin" → `/save-pdf`); build instructions in
   [shortcut_setup.md](shortcut_setup.md).
 - **Desktop browser (macOS / Linux / Windows)** — a bookmarklet. Create a new
   bookmark in any browser and set its URL to (replace `YOUR-SERVER`):

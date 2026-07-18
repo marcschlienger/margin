@@ -20,7 +20,7 @@ RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/margin
+ReadWritePaths=-/var/lib/margin/inbox
 
 [Install]
 WantedBy=multi-user.target
