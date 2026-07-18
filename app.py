@@ -1236,9 +1236,15 @@ async def favicon_svg():
 
 
 @app.get("/favicon-32.png", include_in_schema=False)
-@app.get("/favicon.ico", include_in_schema=False)  # PNG content; browsers go by content type
 async def favicon_png():
     return FileResponse(_STATIC_DIR / "favicon-32.png", media_type="image/png")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_ico():
+    # A genuine ICO container (16+32) — Safari won't accept anything else here.
+    return FileResponse(_STATIC_DIR / "favicon.ico",
+                        media_type="image/x-icon")
 
 
 @app.get("/apple-touch-icon.png", include_in_schema=False)

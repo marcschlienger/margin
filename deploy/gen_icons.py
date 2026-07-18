@@ -23,6 +23,7 @@ SIZES = [
     (180, "apple-touch-icon.png", False),
     (512, "icon-512.png", False),
     (32, "favicon-32.png", True),
+    (16, "favicon-16.png", True),
 ]
 
 svg = (REPO / "static" / "icon.svg").read_text(encoding="utf-8")
@@ -46,3 +47,12 @@ with sync_playwright() as p:
         page.close()
         print(f"wrote static/{name} ({size}x{size})")
     browser.close()
+
+# Bundle a real .ico (16 + 32) — Safari distrusts non-ICO /favicon.ico content.
+from PIL import Image  # noqa: E402  (dev dependency, see requirements-dev.txt)
+
+img32 = Image.open(REPO / "static" / "favicon-32.png")
+img16 = Image.open(REPO / "static" / "favicon-16.png")
+img32.save(REPO / "static" / "favicon.ico", format="ICO",
+           append_images=[img16], sizes=[(32, 32), (16, 16)])
+print("wrote static/favicon.ico (32+16)")

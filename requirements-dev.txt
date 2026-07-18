@@ -1,2 +1,3 @@
 -r requirements.txt
 pytest>=8.0
+pillow>=10.0   # deploy/gen_icons.py only (favicon.ico bundling)
