@@ -37,9 +37,9 @@ import httpx
 import trafilatura
 from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, field_validator
 
 from render import (
@@ -81,7 +81,7 @@ async def lifespan(application: FastAPI):
     await application.state.client.aclose()
 
 
-app = FastAPI(title="Margin", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Margin", version="2.1.0", lifespan=lifespan)
 
 # Allow cross-origin calls (browser extensions, fetch-based clients). The API
 # is unauthenticated and meant for a private network, so origins are not
@@ -977,6 +977,7 @@ _SAVE_PAGE_HTML = """<!doctype html>
 <h1 class="{cls}">{heading}</h1>
 <p>{detail}</p>
 {autoclose}
+<p><a href="/">← Margin inbox</a></p>
 </body></html>"""
 
 
@@ -1015,6 +1016,175 @@ async def save_page(request: Request, url: str = "", formats: str = "pdf"):
         return _save_page_response(True, "Saved", f"{result.get('title', '')} → {files}")
     return _save_page_response(False, "Save failed",
                                result.get("message", "unknown error"))
+
+
+# ---------------------------------------------------------------------------
+# Reading queue — GET / lists the inbox, POST /archive moves items, and
+# GET /files/{name} serves the saved files. Together they make any browser a
+# minimal read-later front end (no notes app or service required).
+# ---------------------------------------------------------------------------
+
+_SERVE_EXTS = (".pdf", ".md", ".tex", ".org")  # order = display order
+_ARCHIVE_SUBDIR = "archive"
+_RE_SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
+
+_INDEX_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Margin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body {{ font: 16px/1.55 -apple-system, system-ui, sans-serif;
+          max-width: 46rem; margin: 3rem auto; padding: 0 1rem; color: #222; }}
+  h1 {{ font-size: 1.4rem; }}
+  h1 a {{ color: inherit; text-decoration: none; }}
+  form.saver {{ display: flex; gap: .6rem; align-items: center;
+                margin: 1rem 0 1.5rem; flex-wrap: wrap; }}
+  form.saver input[type=url] {{ flex: 1; min-width: 14rem; font: inherit;
+          padding: .45rem .6rem; border: 1px solid #bbb; border-radius: 6px; }}
+  form.saver label {{ font-size: .85rem; white-space: nowrap; }}
+  .tabs {{ margin-bottom: .8rem; font-size: .95rem; }}
+  .tabs a {{ margin-right: 1.2rem; }}
+  .item {{ padding: .7rem 0; border-bottom: 1px solid #e6e6e6;
+           display: flex; gap: 1rem; align-items: baseline; }}
+  .date {{ color: #999; font-size: .82rem; white-space: nowrap; }}
+  .main {{ flex: 1; }}
+  .main a.title {{ font-weight: 600; text-decoration: none; }}
+  .links {{ font-size: .82rem; margin-top: .15rem; }}
+  .links a {{ margin-right: .7rem; }}
+  button {{ font: inherit; font-size: .82rem; padding: .25rem .7rem;
+            border: 1px solid #bbb; border-radius: 6px; background: #f7f7f7;
+            cursor: pointer; }}
+  .empty {{ color: #999; margin-top: 2rem; }}
+</style></head>
+<body>
+<h1><a href="/">Margin</a></h1>
+<form class="saver" method="get" action="/save-page">
+  <input type="url" name="url" placeholder="https://…  save a page" required>
+  <label><input type="checkbox" name="formats" value="pdf,md" checked>
+    + Markdown</label>
+  <button type="submit">Save</button>
+</form>
+<div class="tabs">
+  <a href="/">Inbox ({inbox_count})</a>
+  <a href="/?view=archive">Archive ({archive_count})</a>
+</div>
+{rows}
+</body></html>"""
+
+
+def _archive_dir() -> Path:
+    return OUTPUT_DIR / _ARCHIVE_SUBDIR
+
+
+def _read_frontmatter_field(md_path: Path, field: str) -> str | None:
+    try:
+        head = md_path.read_text(encoding="utf-8", errors="replace")[:2048]
+    except OSError:
+        return None
+    m = re.search(rf'^{field}:\s*"?(.*?)"?\s*$', head, re.MULTILINE)
+    if not m:
+        return None
+    return m.group(1).replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _list_items(folder: Path) -> list[dict]:
+    """Group saved files by stem → [{stem, title, date, source, files}]."""
+    groups: dict[str, list[Path]] = {}
+    if folder.is_dir():
+        for f in folder.iterdir():
+            if f.is_file() and f.suffix.lower() in _SERVE_EXTS:
+                groups.setdefault(f.stem, []).append(f)
+
+    items = []
+    for stem, files in groups.items():
+        files.sort(key=lambda f: _SERVE_EXTS.index(f.suffix.lower()))
+        md = next((f for f in files if f.suffix.lower() == ".md"), None)
+        title = _read_frontmatter_field(md, "title") if md else None
+        if not title:
+            title = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem).replace("-", " ") or stem
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})", stem)
+        date_str = (m.group(1) if m
+                    else date.fromtimestamp(files[0].stat().st_mtime).isoformat())
+        source = _read_frontmatter_field(md, "source_url") if md else None
+        items.append({"stem": stem, "title": title, "date": date_str,
+                      "source": source, "files": files})
+    items.sort(key=lambda i: (i["date"], i["stem"]), reverse=True)
+    return items
+
+
+def _item_row(item: dict, view: str) -> str:
+    file_links = "".join(
+        f'<a href="/files/{_html_escape(f.name)}">{f.suffix[1:]}</a> '
+        for f in item["files"]
+    )
+    source = (
+        f'<a href="{_html_escape(item["source"])}">source</a>'
+        if item["source"] else ""
+    )
+    action = "restore" if view == "archive" else "archive"
+    return f"""<div class="item">
+  <span class="date">{item["date"]}</span>
+  <div class="main">
+    <a class="title" href="/files/{_html_escape(item["files"][0].name)}">{_html_escape(item["title"])}</a>
+    <div class="links">{file_links}{source}</div>
+  </div>
+  <form method="post" action="/archive">
+    <input type="hidden" name="stem" value="{_html_escape(item["stem"])}">
+    <input type="hidden" name="action" value="{action}">
+    <button type="submit">{action.capitalize()}</button>
+  </form>
+</div>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(view: str = "inbox"):
+    """Minimal reading-queue UI: saved items with file links and archive."""
+    view = "archive" if view == "archive" else "inbox"
+    folder = _archive_dir() if view == "archive" else OUTPUT_DIR
+    items = _list_items(folder)
+    rows = "\n".join(_item_row(i, view) for i in items) or (
+        '<p class="empty">Nothing here yet.</p>'
+    )
+    return HTMLResponse(_INDEX_HTML.format(
+        inbox_count=len(_list_items(OUTPUT_DIR)) if view == "archive" else len(items),
+        archive_count=len(items) if view == "archive" else len(_list_items(_archive_dir())),
+        rows=rows,
+    ))
+
+
+@app.get("/files/{name}")
+async def get_file(name: str):
+    """Serve a saved file from the output dir (or its archive/ subfolder)."""
+    if "/" in name or "\\" in name or name.startswith(".") or \
+            Path(name).suffix.lower() not in _SERVE_EXTS:
+        raise HTTPException(404)
+    path = OUTPUT_DIR / name
+    if not path.is_file():
+        path = _archive_dir() / name
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path)
+
+
+@app.post("/archive")
+async def archive(stem: str = Form(...), action: str = Form("archive")):
+    """Move all files of one saved item between the inbox and archive/."""
+    if not _RE_SAFE_STEM.match(stem):
+        raise HTTPException(400, detail="invalid stem")
+    if action == "restore":
+        src, dst, back = _archive_dir(), OUTPUT_DIR, "/?view=archive"
+    else:
+        src, dst, back = OUTPUT_DIR, _archive_dir(), "/"
+    moved = 0
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in src.iterdir():
+            if f.is_file() and f.stem == stem and f.suffix.lower() in _SERVE_EXTS:
+                f.rename(_unique_path(dst / f.name))
+                moved += 1
+    if not moved:
+        raise HTTPException(404, detail=f"no files found for {stem!r}")
+    _log("archive", f"{action} {stem} ({moved} files)")
+    return RedirectResponse(url=back, status_code=303)
 
 
 @app.get("/health")

@@ -107,6 +107,25 @@ Multipart form upload, field `file`, ≤ 50 MB. Converts via the
 best-in-class for math PDFs, requires `MATHPIX_APP_ID`/`MATHPIX_APP_KEY`.
 Without credentials the rest of the server works; only this endpoint errors.
 
+### `GET /` — built-in reading queue
+
+A minimal web UI over the output directory: every saved item with its date,
+title (from the Markdown frontmatter when available), links to its files and
+original source, a quick-save box, and an **Archive** button that moves an
+item's files into an `archive/` subfolder (with a restore view at
+`/?view=archive`). With this, any browser is a functional read-later front
+end — no notes app or third-party service required.
+
+Supporting endpoints: `GET /files/{name}` serves saved files (inbox or
+archive; only `.pdf/.md/.tex/.org`, no path traversal), and `POST /archive`
+(form fields `stem`, `action=archive|restore`) moves items.
+
+### `GET /save-page` — bookmarklet target
+
+Same pipeline as `POST /save`, but GET with query parameters
+(`?url=…&formats=pdf,md`) and an HTML result page instead of JSON — made to
+be opened as a browser tab by the desktop bookmarklet (see below).
+
 ### `GET /health`
 
 ```json
@@ -224,6 +243,8 @@ proxy in front of it before exposing it further.
   pages to a plain-http LAN server; opening a tab is always allowed. The
   server also sends permissive CORS headers, so extension-based or
   `fetch`-based clients work too wherever mixed content isn't an issue.)
+- **The built-in queue page** — open `http://YOUR-SERVER:8000/` in any
+  browser: paste a URL to save, read via the file links, archive when done.
 - **Anything that speaks HTTP** — `curl`, RSS-reader automations, Raycast, a
   cron job:
 
