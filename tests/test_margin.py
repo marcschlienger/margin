@@ -239,6 +239,7 @@ def test_icons_public_even_with_token(monkeypatch, tmp_path):
         ("/favicon.ico", "image/x-icon"),  # real ICO for Safari
         ("/favicon-32.png", "image/png"),
         ("/apple-touch-icon.png", "image/png"),
+        ("/apple-touch-icon-precomposed.png", "image/png"),
         ("/static/icon-512.png", "image/png"),
         ("/manifest.json", "application/manifest+json"),
     ]:

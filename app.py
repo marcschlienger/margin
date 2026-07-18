@@ -129,6 +129,7 @@ _PUBLIC_PATHS = {
     "/favicon.ico",
     "/favicon-32.png",
     "/apple-touch-icon.png",
+    "/apple-touch-icon-precomposed.png",
     "/manifest.json",
 }
 
@@ -1248,6 +1249,7 @@ async def favicon_ico():
 
 
 @app.get("/apple-touch-icon.png", include_in_schema=False)
+@app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)  # legacy Safari probe
 async def apple_touch_icon():
     return FileResponse(_STATIC_DIR / "apple-touch-icon.png")
 
