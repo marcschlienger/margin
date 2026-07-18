@@ -56,6 +56,11 @@ All save endpoints respond with HTTP 200 and a JSON body containing
 `"status": "ok"` or `"status": "error"` — errors are in-band so that iOS
 Shortcuts can display the message instead of failing silently.
 
+If `MARGIN_TOKEN` is set, every endpoint below except `GET /health` also
+requires the token (`Authorization: Bearer <token>` header, `?token=`
+parameter, or the browser cookie) and answers HTTP 401 without it — see
+[Authentication](#authentication-optional).
+
 ### `POST /save` — save any page (the general endpoint)
 
 ```json
@@ -354,8 +359,11 @@ Tailscale, WireGuard) and/or set `MARGIN_TOKEN` — see
   ```bash
   curl -X POST http://server:8000/save \
     -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $MARGIN_TOKEN" \
     -d '{"url": "https://en.wikipedia.org/wiki/Fourier_transform"}'
   ```
+
+  (drop the `Authorization` header if you haven't set `MARGIN_TOKEN`)
 
 ## Limitations & roadmap
 
