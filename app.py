@@ -121,7 +121,15 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 _TOKEN_COOKIE = "margin_token"
-_PUBLIC_PATHS = {"/health"}
+# /health for monitoring; icons/manifest so browser chrome (favicon requests,
+# home-screen installs) works without credentials — none of them are sensitive.
+_PUBLIC_PATHS = {
+    "/health",
+    "/favicon.svg",
+    "/favicon.ico",
+    "/apple-touch-icon.png",
+    "/manifest.json",
+}
 
 _UNAUTHORIZED_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Margin — unauthorized</title></head>
@@ -147,6 +155,7 @@ async def _require_token(request: Request, call_next):
     if (
         not MARGIN_TOKEN
         or request.url.path in _PUBLIC_PATHS
+        or request.url.path.startswith("/static/")
         or request.method == "OPTIONS"  # CORS preflight carries no credentials
     ):
         return await call_next(request)
@@ -1205,11 +1214,46 @@ async def save_pdf(file: UploadFile = File(...)):
     return _ok(md_path, title)
 
 
+# ---------------------------------------------------------------------------
+# Icon / manifest — served from static/ (public: favicon requests and
+# home-screen installs don't carry credentials)
+# ---------------------------------------------------------------------------
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+_HEAD_ICONS = """<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">"""
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)  # served as SVG; browsers go by content type
+async def favicon():
+    return FileResponse(_STATIC_DIR / "icon.svg", media_type="image/svg+xml")
+
+
+@app.get("/apple-touch-icon.png", include_in_schema=False)
+async def apple_touch_icon():
+    return FileResponse(_STATIC_DIR / "apple-touch-icon.png")
+
+
+@app.get("/static/icon-512.png", include_in_schema=False)
+async def icon_512():
+    return FileResponse(_STATIC_DIR / "icon-512.png")
+
+
+@app.get("/manifest.json", include_in_schema=False)
+async def manifest():
+    return FileResponse(_STATIC_DIR / "manifest.json",
+                        media_type="application/manifest+json")
+
+
 # Result page for the /save-page bookmarklet flow. Doubled braces are literal
 # CSS braces (str.format).
 _SAVE_PAGE_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Margin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+__HEAD_ICONS__
 <style>
   body {{ font: 16px/1.5 -apple-system, system-ui, sans-serif;
           max-width: 34rem; margin: 4rem auto; padding: 0 1rem; }}
@@ -1230,7 +1274,7 @@ def _save_page_response(ok: bool, heading: str, detail: str) -> HTMLResponse:
         "<script>setTimeout(function () { window.close(); }, 2500)</script>"
         if ok else ""
     )
-    return HTMLResponse(_SAVE_PAGE_HTML.format(
+    return HTMLResponse(_SAVE_PAGE_HTML.replace("__HEAD_ICONS__", _HEAD_ICONS).format(
         cls="ok" if ok else "err",
         heading=_html_escape(heading),
         detail=_html_escape(detail),
@@ -1279,6 +1323,7 @@ _RE_SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
 _INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Margin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+__HEAD_ICONS__
 <style>
   :root { color-scheme: light dark;
           --muted: #8a8a8e; --line: #88888833; --btn: #88888818; }
@@ -1413,6 +1458,7 @@ async def index(view: str = "inbox"):
     inbox_n = len(_list_items(OUTPUT_DIR)) if view == "archive" else len(items)
     archive_n = len(items) if view == "archive" else len(_list_items(_archive_dir()))
     html = (_INDEX_HTML
+            .replace("__HEAD_ICONS__", _HEAD_ICONS)
             .replace("__INBOX_COUNT__", str(inbox_n))
             .replace("__ARCHIVE_COUNT__", str(archive_n))
             .replace("__ROWS__", rows))

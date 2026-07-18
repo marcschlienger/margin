@@ -230,6 +230,21 @@ def test_auth_enforced_and_cookie_flow(tmp_path, monkeypatch):
     assert client.get("/").status_code == 200
 
 
+def test_icons_public_even_with_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    client = TestClient(app.app)
+    for path, ctype in [
+        ("/favicon.svg", "image/svg+xml"),
+        ("/apple-touch-icon.png", "image/png"),
+        ("/static/icon-512.png", "image/png"),
+        ("/manifest.json", "application/manifest+json"),
+    ]:
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert r.headers["content-type"].startswith(ctype), path
+
+
 def test_health_open_and_reports_auth(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
