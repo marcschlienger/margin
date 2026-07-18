@@ -238,3 +238,11 @@ proxy in front of it before exposing it further.
 | `description.md` | Architecture and the seven math-extraction strategies |
 | `shortcut_setup.md` | Step-by-step iOS Shortcut construction |
 | `start.sh` | launchd-friendly start wrapper (macOS) |
+
+## License
+
+Margin is free software, licensed under the
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later).
+You may run, study, modify, and share it; if you offer a modified version
+as a network service, you must make your modified source available to its
+users. Copyright © 2026 Marc Schlienger.
