@@ -326,9 +326,9 @@ Requires the Mac server to be running. Each shortcut is a thin client: it POSTs
 the URL or PDF to the server and shows a notification with the saved filename.
 All conversion logic runs on the Mac.
 
-- `Math Inbox — URL`: Share Sheet type = URLs. POSTs `{"url": "..."}` to
+- `Margin — URL`: Share Sheet type = URLs. POSTs `{"url": "..."}` to
   `/save-url` with `Accept: application/json` header.
-- `Math Inbox — PDF`: Share Sheet type = PDFs. POSTs the file as multipart form
+- `Margin — PDF`: Share Sheet type = PDFs. POSTs the file as multipart form
   data to `/save-pdf`.
 
 Both include an explicit "Get Dictionary from Input" step before "Get Dictionary

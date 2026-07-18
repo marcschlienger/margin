@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Margin — self-hosted read-later server. Copyright (C) 2026 Marc Schlienger
+# Licensed under the GNU AGPL v3.0 or later; see the LICENSE file for details.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
 # Install Margin as a systemd service on Ubuntu (20.04+). Run as root:
 #
 #   sudo bash deploy/install.sh

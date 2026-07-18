@@ -207,8 +207,23 @@ proxy in front of it before exposing it further.
 
 ## Capture clients
 
-- **iOS Share Sheet** — two small Shortcuts (URL → `/save-url`, PDF →
-  `/save-pdf`); build instructions in [shortcut_setup.md](shortcut_setup.md).
+- **iOS Share Sheet** — two small Shortcuts ("Margin — URL" → `/save-url`,
+  "Margin — PDF" → `/save-pdf`); build instructions in
+  [shortcut_setup.md](shortcut_setup.md).
+- **Desktop browser (macOS / Linux / Windows)** — a bookmarklet. Create a new
+  bookmark in any browser and set its URL to (replace `YOUR-SERVER`):
+
+  ```
+  javascript:window.open('http://YOUR-SERVER:8000/save-page?url='+encodeURIComponent(location.href));
+  ```
+
+  Clicking it while reading any page opens a small tab that saves the page as
+  PDF, reports the result, and closes itself. Append `&formats=pdf,md` inside
+  the quoted URL to also get Markdown. (The bookmarklet navigates instead of
+  using `fetch()` because browsers block mixed-content requests from https
+  pages to a plain-http LAN server; opening a tab is always allowed. The
+  server also sends permissive CORS headers, so extension-based or
+  `fetch`-based clients work too wherever mixed content isn't an issue.)
 - **Anything that speaks HTTP** — `curl`, RSS-reader automations, Raycast, a
   cron job:
 
@@ -224,8 +239,8 @@ proxy in front of it before exposing it further.
   may refuse the headless browser; Margin detects this and returns a clear
   error instead of saving the challenge page. Workaround: print the page to
   PDF on-device and use `/save-pdf`.
-- No authentication and no CORS headers yet — a browser bookmarklet would need
-  a small CORS middleware; planned.
+- No authentication — keep the server on a private network (LAN, Tailscale,
+  WireGuard) or behind an authenticating reverse proxy.
 - Planned: optional upload of saved PDFs to Readwise Reader via its API.
 
 ## Repository layout

@@ -1,4 +1,14 @@
-"""Read-It-Later server — saves web pages with JS/math rendering intact.
+# Margin — self-hosted read-later server that preserves JS/math rendering.
+# Copyright (C) 2026 Marc Schlienger
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. See the LICENSE file for details.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Margin — read-later server that saves web pages with JS/math rendering intact.
 
 POST /save       { "url": "https://...", "formats": ["pdf", "md"] }
 POST /save-url   { "url": "https://..." }   Markdown pipeline (legacy alias)
@@ -19,6 +29,7 @@ import traceback
 import unicodedata
 from contextlib import asynccontextmanager
 from datetime import date
+from html import escape as _html_escape
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,6 +38,8 @@ import trafilatura
 from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, field_validator
 
 from render import (
@@ -69,6 +82,16 @@ async def lifespan(application: FastAPI):
 
 
 app = FastAPI(title="Margin", version="2.0.0", lifespan=lifespan)
+
+# Allow cross-origin calls (browser extensions, fetch-based clients). The API
+# is unauthenticated and meant for a private network, so origins are not
+# restricted; no cookies/credentials are involved.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +960,61 @@ async def save_pdf(file: UploadFile = File(...)):
         return _err(f"Could not write file: {e}")
     _log("save-pdf", f"saved → {md_path.name}")
     return _ok(md_path, title)
+
+
+# Result page for the /save-page bookmarklet flow. Doubled braces are literal
+# CSS braces (str.format).
+_SAVE_PAGE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Margin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body {{ font: 16px/1.5 -apple-system, system-ui, sans-serif;
+          max-width: 34rem; margin: 4rem auto; padding: 0 1rem; }}
+  h1 {{ font-size: 1.3rem; }}
+  .ok {{ color: #2e7d32; }} .err {{ color: #c62828; }}
+</style></head>
+<body>
+<h1 class="{cls}">{heading}</h1>
+<p>{detail}</p>
+{autoclose}
+</body></html>"""
+
+
+def _save_page_response(ok: bool, heading: str, detail: str) -> HTMLResponse:
+    autoclose = (
+        "<p>This tab will close by itself.</p>"
+        "<script>setTimeout(function () { window.close(); }, 2500)</script>"
+        if ok else ""
+    )
+    return HTMLResponse(_SAVE_PAGE_HTML.format(
+        cls="ok" if ok else "err",
+        heading=_html_escape(heading),
+        detail=_html_escape(detail),
+        autoclose=autoclose,
+    ))
+
+
+@app.get("/save-page", response_class=HTMLResponse)
+async def save_page(request: Request, url: str = "", formats: str = "pdf"):
+    """Desktop-browser capture: open from a bookmarklet, get an HTML result.
+
+    A bookmarklet opens this in a new tab (`window.open`). A top-level
+    navigation is used instead of fetch() because browsers block fetch from
+    an https page to a plain-http LAN server (mixed content), but allow
+    navigating to it. `formats` is comma-separated, e.g. "pdf,md".
+    """
+    fmt_list = [f for f in re.split(r"[\s,]+", formats) if f]
+    try:
+        payload = SavePayload(url=url, formats=fmt_list or ["pdf"])
+    except ValueError as e:
+        return _save_page_response(False, "Invalid request", str(e))
+
+    result = await save(payload, request)
+    if result.get("status") == "ok":
+        files = ", ".join(result.get("files", []))
+        return _save_page_response(True, "Saved", f"{result.get('title', '')} → {files}")
+    return _save_page_response(False, "Save failed",
+                               result.get("message", "unknown error"))
 
 
 @app.get("/health")

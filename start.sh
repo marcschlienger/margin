@@ -1,4 +1,8 @@
 #!/bin/bash
+# Margin — self-hosted read-later server. Copyright (C) 2026 Marc Schlienger
+# Licensed under the GNU AGPL v3.0 or later; see the LICENSE file for details.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 cd "$(dirname "$0")"
 
 # Rotate the log if it has grown past ~5 MB — keep only the last 1000 lines.

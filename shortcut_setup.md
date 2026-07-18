@@ -11,10 +11,10 @@ Four shortcuts are described here (Option B recommended):
 
 | Name | Accepts | Requires server? |
 |---|---|---|
-| **Math Inbox — URL** | URLs | Yes (Option B) |
-| **Math Inbox — PDF** | PDF files | Yes (Option B) |
-| **Math Inbox — URL (standalone)** | URLs | No (Option A) |
-| **Math Inbox — PDF (standalone)** | PDF files | No (Option A) |
+| **Margin — URL** | URLs | Yes (Option B) |
+| **Margin — PDF** | PDF files | Yes (Option B) |
+| **Margin — URL (standalone)** | URLs | No (Option A) |
+| **Margin — PDF (standalone)** | PDF files | No (Option A) |
 
 ---
 
@@ -35,12 +35,12 @@ stays server-side.
 
 ---
 
-### Shortcut 1 of 2 — "Math Inbox — URL"
+### Shortcut 1 of 2 — "Margin — URL"
 
 **Step 1 — Create and configure**
 
 1. Open the **Shortcuts** app → tap **+** (top right).
-2. Tap the title field at the top → type **Math Inbox — URL** → tap **Done**.
+2. Tap the title field at the top → type **Margin — URL** → tap **Done**.
 3. Tap **ⓘ** (bottom right) → turn on **Show in Share Sheet**.
 4. Tap **Share Sheet Types** → deselect everything except **URLs** → tap **Done**.
 5. Tap **Done** to close the details panel.
@@ -81,7 +81,7 @@ stays server-side.
 **Step 4 — Notify**
 
 16. Tap **Add Action** → search for **Show Notification** → tap it.
-    - Title: `Math Inbox`
+    - Title: `Margin`
     - Body: tap the field → type `Saved: ` → tap the variable icon → pick
       **Dictionary Value** → type ` ` → tap the variable icon again → pick
       **Dictionary Value 2**.
@@ -93,12 +93,12 @@ stays server-side.
 
 ---
 
-### Shortcut 2 of 2 — "Math Inbox — PDF"
+### Shortcut 2 of 2 — "Margin — PDF"
 
 **Step 1 — Create and configure**
 
 1. Open **Shortcuts** → tap **+**.
-2. Name it **Math Inbox — PDF**.
+2. Name it **Margin — PDF**.
 3. Tap **ⓘ** → turn on **Show in Share Sheet**.
 4. Tap **Share Sheet Types** → deselect everything except **PDFs** → tap **Done**.
 5. Tap **Done** to close the details panel.
@@ -119,9 +119,8 @@ stays server-side.
     - Value: `application/json`
 
 **Step 3 — Parse the response**
-ls
 
-1. Tap **Add Action** → **Get Dictionary from Input** → Input: **Contents of URL**.
+13. Tap **Add Action** → **Get Dictionary from Input** → Input: **Contents of URL**.
 
 14. Tap **Add Action** → **Get Dictionary Value** → Key: `filename`,
     Dictionary: **Dictionary**. The result is **Dictionary Value**.
@@ -132,7 +131,7 @@ ls
 **Step 4 — Notify**
 
 16. Tap **Add Action** → **Show Notification**.
-    - Title: `Math Inbox`
+    - Title: `Margin`
     - Body: `Saved: ` + **Dictionary Value** + ` ` + **Dictionary Value 2**.
     - On success you see the filename; on error you see the server's error message.
 
@@ -144,10 +143,10 @@ ls
 
 | Share source | What to share | Which shortcut appears |
 |---|---|---|
-| Safari | current page URL | Math Inbox — URL |
-| NetNewsWire / Unread | article link | Math Inbox — URL |
-| Files app | a PDF file | Math Inbox — PDF |
-| Safari | a PDF opened in browser | Math Inbox — PDF |
+| Safari | current page URL | Margin — URL |
+| NetNewsWire / Unread | article link | Margin — URL |
+| Files app | a PDF file | Margin — PDF |
+| Safari | a PDF opened in browser | Margin — PDF |
 
 ---
 
@@ -186,7 +185,7 @@ inside the shortcut — do not share the shortcut file.
 
 ---
 
-### Shortcut A1 — "Math Inbox — URL (standalone)"
+### Shortcut A1 — "Margin — URL (standalone)"
 
 Share Sheet Types: **URLs only**
 
@@ -250,7 +249,7 @@ After the three credential actions:
 
 ---
 
-### Shortcut A2 — "Math Inbox — PDF (standalone)"
+### Shortcut A2 — "Margin — PDF (standalone)"
 
 Share Sheet Types: **PDFs only**
 
@@ -342,7 +341,9 @@ After the three credential actions:
 
 | Endpoint | Method | Body | Returns |
 |---|---|---|---|
+| `POST /save` | POST | JSON `{"url":"…","formats":["pdf","md"]}` | `{"status":"ok","files":[…],"title":"..."}` |
 | `POST /save-url` | POST | JSON `{"url":"https://..."}` | `{"status":"ok","filename":"...","title":"..."}` |
 | `POST /save-pdf` | POST | multipart form, field `file` | `{"status":"ok","filename":"...","title":"..."}` |
+| `GET /save-page` | GET | query `?url=…&formats=pdf,md` | HTML result page (desktop bookmarklet) |
 | `POST /echo` | POST | anything | mirrors back headers + body |
 | `GET /health` | GET | — | server status + config check |
