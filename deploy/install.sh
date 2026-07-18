@@ -71,3 +71,6 @@ echo
 echo "Done. Verify with:  curl http://localhost:8000/health"
 echo "Saved files land in: $OUTPUT_DIR"
 echo "Logs:               journalctl -u margin -f"
+echo
+echo "Optional hardening: set MARGIN_TOKEN in $APP_DIR/.env (see .env.example)"
+echo "and 'systemctl restart margin' to require an API token on all endpoints."

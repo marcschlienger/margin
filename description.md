@@ -53,7 +53,7 @@ bookmarklet hitting `/save-page`, or from anything that can POST JSON.
 | `deploy/install.sh` | Ubuntu installer — venv, Chromium, systemd service |
 | `deploy/margin.service` | systemd unit for the Ubuntu deployment |
 | `requirements.txt` | Python dependencies |
-| `.env` | Mathpix credentials (`MATHPIX_APP_ID`, `MATHPIX_APP_KEY`) |
+| `.env` | Config: Mathpix credentials, `OUTPUT_DIR`, `MARGIN_TOKEN` |
 | `.env.example` | Template for `.env` — copy to `.env` and fill in |
 | `start.sh` | Start wrapper (used by the macOS Launch Agent; runs `app.py`) |
 | `shortcut_setup.md` | Step-by-step instructions for building the iOS Shortcuts |
@@ -81,6 +81,11 @@ only `/save-pdf` returns an error.
 ---
 
 ## Server Endpoints
+
+> If the `MARGIN_TOKEN` environment variable is set, every endpoint except
+> `GET /health` requires the token — via `Authorization: Bearer` header,
+> `?token=` query parameter, or the browser cookie set after one
+> authenticated visit. See the README's Authentication section.
 
 ### `POST /save`
 

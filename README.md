@@ -179,6 +179,97 @@ Debug helper: echoes method, headers, and parsed body of the request back.
 | Output directory | `--output-dir` flag > `OUTPUT_DIR` env var (both also read from `.env`) | iCloud `ReadLater/inbox` on macOS, `~/ReadLater/inbox` elsewhere |
 | Bind address / port | `--host` / `--port` flags, or `HOST` / `PORT` env vars | `0.0.0.0` / `8000` |
 | Mathpix credentials | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` in `.env` | unset — `/save-pdf` disabled |
+| API token | `MARGIN_TOKEN` in `.env` | unset — no authentication |
+
+## Authentication (optional)
+
+Set `MARGIN_TOKEN` and every endpoint except `GET /health` requires it:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(24))"  # generate one
+echo "MARGIN_TOKEN=paste-it-here" >> .env                      # then restart
+```
+
+Clients can present the token three ways:
+
+- **`Authorization: Bearer <token>` header** — preferred for curl and the iOS
+  Shortcuts (one extra header field; see
+  [shortcut_setup.md](shortcut_setup.md)). Keeps the token out of access logs.
+- **`?token=<token>` query parameter** — for URL-only contexts like the
+  bookmarklet. Query strings do appear in the server's access log.
+- **Browser cookie** — open `http://YOUR-SERVER:8000/?token=<token>` once and
+  the token is stored in an `HttpOnly`, `SameSite=Strict` cookie (1 year);
+  after that the queue UI, file links, and archive buttons work with no
+  decoration. Because the cookie is `Strict`, other websites can never ride
+  it — enabling the token also closes the drive-by CSRF window that an open
+  LAN server inherently has.
+
+With a token set, the bookmarklet becomes:
+
+```
+javascript:window.open('http://YOUR-SERVER:8000/save-page?token=YOUR-TOKEN&url='+encodeURIComponent(location.href));
+```
+
+`GET /health` stays open (it reports `"auth_required": true` so clients can
+detect the requirement) and CORS preflights pass through, as they carry no
+credentials.
+
+## Remote access via Tailscale
+
+[Tailscale](https://tailscale.com) is the easiest way to use Margin away from
+home without exposing it to the internet: every device gets a stable private
+`100.x.y.z` address inside an encrypted WireGuard mesh, and nothing is
+reachable from the public internet.
+
+**1. Install it on the server and your devices.**
+
+```bash
+# Ubuntu server
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+iPhone/iPad/Mac: install the Tailscale app and sign in to the same tailnet.
+
+**2. Find the server's tailnet address.**
+
+```bash
+tailscale ip -4        # e.g. 100.101.102.103
+tailscale status       # shows the machine name, e.g. "margin-box"
+```
+
+With MagicDNS (on by default for new tailnets) the name works too:
+`http://margin-box:8000`.
+
+**3. Point every client at it.** Use the tailnet address instead of the LAN
+IP in the iOS Shortcuts (`http://100.101.102.103:8000/save-url`), the
+bookmarklet, and the queue page. It works identically at home and away — no
+special-casing, no port forwarding, no dynamic DNS.
+
+**4. Choose how tight to lock it down.** Two good setups:
+
+- **Simple (recommended):** keep the default bind (`0.0.0.0`), set
+  `MARGIN_TOKEN`. Reachable on LAN and tailnet, but every request needs the
+  token. On a tailnet you share with others, also restrict port 8000 to your
+  own devices in the Tailscale admin ACLs.
+- **Tailnet-only + HTTPS:** bind Margin to loopback and let Tailscale proxy
+  it with a real TLS certificate:
+
+  ```bash
+  # in /etc/systemd/system/margin.service: ExecStart ... --host 127.0.0.1
+  sudo systemctl daemon-reload && sudo systemctl restart margin
+  sudo tailscale serve --bg 8000
+  ```
+
+  Margin is now at `https://margin-box.<your-tailnet>.ts.net` (no port, note
+  the **https**) and unreachable from the LAN or anywhere outside the
+  tailnet. The HTTPS URL has a bonus: browsers no longer treat the server as
+  mixed content, so `fetch()`-based clients and extensions work from https
+  pages too. `MARGIN_TOKEN` is still worth setting on shared tailnets.
+
+The iOS Shortcuts, the bookmarklet, and `curl` all work unchanged over
+Tailscale — only the address (and with `tailscale serve`, the scheme)
+changes.
 
 ## Install
 
@@ -231,9 +322,10 @@ journalctl -u margin -f
 sudo systemctl restart margin        # e.g. after editing /opt/margin/.env
 ```
 
-The service listens on all interfaces without authentication — run it on a
-private network (LAN, Tailscale, WireGuard) or put an authenticating reverse
-proxy in front of it before exposing it further.
+The service listens on all interfaces; run it on a private network (LAN,
+Tailscale, WireGuard) and/or set `MARGIN_TOKEN` — see
+[Authentication](#authentication-optional) and
+[Remote access via Tailscale](#remote-access-via-tailscale) above.
 
 ## Capture clients
 
@@ -271,8 +363,9 @@ proxy in front of it before exposing it further.
   may refuse the headless browser; Margin detects this and returns a clear
   error instead of saving the challenge page. Workaround: print the page to
   PDF on-device and use `/save-pdf`.
-- No authentication — keep the server on a private network (LAN, Tailscale,
-  WireGuard) or behind an authenticating reverse proxy.
+- Authentication is optional (`MARGIN_TOKEN`) and coarse — one shared token,
+  no users or rate limiting. Keep the server on a private network (LAN,
+  Tailscale, WireGuard) regardless.
 - Planned: optional upload of saved PDFs to Readwise Reader via its API.
 
 ## Repository layout

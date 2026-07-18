@@ -36,6 +36,9 @@ iOS and are only worth building if you can't run the server at all.
     `http://192.168.1.42:8000`
   - Away from home → install [Tailscale](https://tailscale.com) on the phone
     and the server; use the server's Tailscale IP, e.g. `http://100.x.y.z:8000`
+    (full guide: "Remote access via Tailscale" in the README)
+- If the server sets `MARGIN_TOKEN`, each shortcut needs one extra header —
+  the build steps below mention where.
 
 ---
 
@@ -65,6 +68,9 @@ iOS and are only worth building if you can't run the server at all.
     field**. Set Key: `Accept`, Value: `application/json`. This tells the
     server the client expects JSON back, so the response is parsed correctly
     by the next steps.
+    *If your server sets `MARGIN_TOKEN`*: add a second header — Key:
+    `Authorization`, Value: `Bearer YOUR-TOKEN` (the word "Bearer", a space,
+    then the token).
 
 **Step 3 — Parse the response**
 
@@ -121,6 +127,9 @@ iOS and are only worth building if you can't run the server at all.
 12. In the **Headers** section, tap **Add new field**:
     - Key: `Accept`
     - Value: `application/json`
+
+    *If your server sets `MARGIN_TOKEN`*: add a second header — Key:
+    `Authorization`, Value: `Bearer YOUR-TOKEN`.
 
 **Step 3 — Parse the response**
 

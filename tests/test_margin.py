@@ -187,6 +187,59 @@ def test_list_items_groups_and_titles(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Token auth (MARGIN_TOKEN)
+# ---------------------------------------------------------------------------
+
+from fastapi.testclient import TestClient
+
+
+def test_auth_disabled_when_no_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "")
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    assert TestClient(app.app).get("/").status_code == 200
+
+
+def test_auth_enforced_and_cookie_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    client = TestClient(app.app)
+
+    # /health stays open; everything else is rejected without the token
+    assert client.get("/health/../").status_code in (401, 404)
+    r = client.get("/", headers={"accept": "text/html"})
+    assert r.status_code == 401 and "token required" in r.text
+    assert client.post(
+        "/save-url", json={"url": "https://a.test/x"}
+    ).status_code == 401
+    assert client.get("/files/x.pdf").status_code == 401
+
+    # Bearer header works
+    assert client.get(
+        "/", headers={"Authorization": "Bearer s3cret"}
+    ).status_code == 200
+    # Wrong token still rejected
+    assert client.get(
+        "/", headers={"Authorization": "Bearer nope"}
+    ).status_code == 401
+
+    # Query token works and sets the SameSite=Strict cookie...
+    r = client.get("/?token=s3cret")
+    assert r.status_code == 200
+    assert "margin_token" in r.cookies or "margin_token" in client.cookies
+    # ...after which plain browsing works via the cookie
+    assert client.get("/").status_code == 200
+
+
+def test_health_open_and_reports_auth(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    with TestClient(app.app) as client:  # lifespan: /health touches app.state
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["auth_required"] is True
+
+
+# ---------------------------------------------------------------------------
 # Renderer heuristics
 # ---------------------------------------------------------------------------
 

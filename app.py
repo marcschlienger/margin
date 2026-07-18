@@ -32,6 +32,7 @@ import subprocess
 import sys
 import traceback
 import unicodedata
+import secrets
 from contextlib import asynccontextmanager
 from datetime import date
 from html import escape as _html_escape
@@ -44,7 +45,12 @@ from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+)
 from pydantic import BaseModel, field_validator
 
 from render import (
@@ -65,6 +71,11 @@ load_dotenv()
 MATHPIX_APP_ID  = os.getenv("MATHPIX_APP_ID", "")
 MATHPIX_APP_KEY = os.getenv("MATHPIX_APP_KEY", "")
 MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB cap on PDF uploads
+
+# Optional API token. Unset → open server (private-network use). Set → every
+# endpoint except /health requires it: `Authorization: Bearer <token>` header,
+# `?token=` query parameter, or the cookie set after one authenticated visit.
+MARGIN_TOKEN = os.getenv("MARGIN_TOKEN", "").strip()
 
 
 def _default_output_dir() -> Path:
@@ -93,15 +104,73 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="Margin", version="2.1.0", lifespan=lifespan)
 
-# Allow cross-origin calls (browser extensions, fetch-based clients). The API
-# is unauthenticated and meant for a private network, so origins are not
-# restricted; no cookies/credentials are involved.
+# Allow cross-origin calls (browser extensions, fetch-based clients). Origins
+# are not restricted — the server is either on a private network or protected
+# by MARGIN_TOKEN; the auth cookie is SameSite=Strict and never sent
+# cross-origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Optional token auth (MARGIN_TOKEN)
+# ---------------------------------------------------------------------------
+
+_TOKEN_COOKIE = "margin_token"
+_PUBLIC_PATHS = {"/health"}
+
+_UNAUTHORIZED_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Margin — unauthorized</title></head>
+<body style="font: 16px/1.5 system-ui, sans-serif; max-width: 34rem;
+             margin: 4rem auto; padding: 0 1rem;">
+<h1 style="font-size:1.3rem; color:#c62828;">401 — token required</h1>
+<p>This Margin server requires an API token. Open
+<code>/?token=YOUR-TOKEN</code> once to store it in a cookie for this
+browser, or send an <code>Authorization: Bearer</code> header.</p>
+</body></html>"""
+
+
+def _request_token(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (request.query_params.get("token")
+            or request.cookies.get(_TOKEN_COOKIE, ""))
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    if (
+        not MARGIN_TOKEN
+        or request.url.path in _PUBLIC_PATHS
+        or request.method == "OPTIONS"  # CORS preflight carries no credentials
+    ):
+        return await call_next(request)
+
+    if not secrets.compare_digest(_request_token(request), MARGIN_TOKEN):
+        if "text/html" in request.headers.get("accept", ""):
+            return HTMLResponse(_UNAUTHORIZED_HTML, status_code=401)
+        return JSONResponse(
+            {"status": "error", "filename": "",
+             "message": "Unauthorized: missing or wrong token "
+                        "(Authorization: Bearer header or ?token= parameter)"},
+            status_code=401,
+        )
+
+    response = await call_next(request)
+    if request.query_params.get("token"):
+        # Remember a query-supplied token so plain browsing works afterwards.
+        # SameSite=Strict: never sent on cross-site requests, so third-party
+        # pages cannot ride this cookie (no CSRF).
+        response.set_cookie(
+            _TOKEN_COOKIE, MARGIN_TOKEN, max_age=365 * 24 * 3600,
+            httponly=True, samesite="strict",
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1399,6 +1468,7 @@ async def health(request: Request):
         "pandoc_available": shutil.which("pandoc") is not None,
         "playwright_available": request.app.state.renderer.available,
         "mathpix_configured": bool(MATHPIX_APP_ID and MATHPIX_APP_KEY),
+        "auth_required": bool(MARGIN_TOKEN),
     }
 
 
