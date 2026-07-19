@@ -222,6 +222,24 @@ def test_list_items_groups_and_titles(tmp_path, monkeypatch):
 from fastapi.testclient import TestClient
 
 
+def test_responses_carry_notification_summary(tmp_path, monkeypatch):
+    assert app._err("boom")["summary"] == "Error: boom"
+    assert app._ok(tmp_path / "a.md", "T")["summary"] == "Saved: a.md"
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-x.pdf").write_bytes(b"%PDF")
+    app._record_url("https://a.test/x", "2026-07-19-x")
+    dup = app._duplicate_response(app._find_existing("https://a.test/x"))
+    assert dup["summary"] == "Already saved: 2026-07-19-x.pdf"
+
+
+def test_unauthorized_page_has_token_form(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    r = TestClient(app.app).get("/", headers={"accept": "text/html"})
+    assert r.status_code == 401
+    assert 'name="token"' in r.text and 'action="/"' in r.text
+
+
 def test_auth_disabled_when_no_token(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "MARGIN_TOKEN", "")
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
@@ -236,7 +254,7 @@ def test_auth_enforced_and_cookie_flow(tmp_path, monkeypatch):
     # /health stays open; everything else is rejected without the token
     assert client.get("/health/../").status_code in (401, 404)
     r = client.get("/", headers={"accept": "text/html"})
-    assert r.status_code == 401 and "token required" in r.text
+    assert r.status_code == 401 and "Token required" in r.text
     assert client.post(
         "/save-url", json={"url": "https://a.test/x"}
     ).status_code == 401

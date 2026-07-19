@@ -374,6 +374,10 @@ Tailscale, WireGuard) and/or use the per-instance `MARGIN_TOKEN` — see
   `fetch`-based clients work too wherever mixed content isn't an issue.)
 - **The built-in queue page** — open `http://YOUR-SERVER:8000/` in any
   browser: paste a URL to save, read via the file links, archive when done.
+  On iPhone/iPad, Safari's Share → **Add to Home Screen** installs it as a
+  full-screen app with the Margin icon; with `MARGIN_TOKEN` set, the
+  installed app prompts for the token once on first launch (its cookie
+  storage is separate from Safari's).
 - **Anything that speaks HTTP** — `curl`, RSS-reader automations, Raycast, a
   cron job:
 

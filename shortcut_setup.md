@@ -80,26 +80,20 @@ iOS and are only worth building if you can't run the server at all.
       step, Shortcuts sometimes treats a JSON response as plain Text and the next
       step fails with "couldn't convert from Text to Dictionary".
 
-14. Tap **Add Action** → **Get Dictionary Value** → Key: `filename`,
-    Dictionary: **Dictionary**. The result is a variable named **Dictionary Value**.
-
-15. Tap **Add Action** → **Get Dictionary Value** → Key: `message`,
-    Dictionary: **Dictionary**. The result is named **Dictionary Value 2**
-    (Shortcuts auto-numbers identical action outputs — there's no need to
-    rename anything).
+14. Tap **Add Action** → **Get Dictionary Value** → Key: `summary`,
+    Dictionary: **Dictionary**. The server pre-formats this one field for
+    notifications — `Saved: <filename>` on success, `Error: <reason>` on
+    failure, `Already saved: <filename>` for duplicates — so no further
+    dictionary lookups or text assembly are needed.
 
 **Step 4 — Notify**
 
-16. Tap **Add Action** → search for **Show Notification** → tap it.
+15. Tap **Add Action** → search for **Show Notification** → tap it.
     - Title: `Margin`
-    - Body: tap the field → type `Saved: ` → tap the variable icon → pick
-      **Dictionary Value** → type ` ` → tap the variable icon again → pick
-      **Dictionary Value 2**.
-    - On success the second value is empty, so the notification reads
-      `Saved: 2026-04-26-title.md`. On error the first is empty, so you see
-      the error message from the server instead.
+    - Body: tap the field → tap the variable icon (the `x` in a circle) →
+      pick **Dictionary Value**.
 
-17. Tap **Done** (top right).
+16. Tap **Done** (top right).
 
 ---
 
@@ -135,20 +129,17 @@ iOS and are only worth building if you can't run the server at all.
 
 13. Tap **Add Action** → **Get Dictionary from Input** → Input: **Contents of URL**.
 
-14. Tap **Add Action** → **Get Dictionary Value** → Key: `filename`,
-    Dictionary: **Dictionary**. The result is **Dictionary Value**.
-
-15. Tap **Add Action** → **Get Dictionary Value** → Key: `message`,
-    Dictionary: **Dictionary**. The result is **Dictionary Value 2**.
+14. Tap **Add Action** → **Get Dictionary Value** → Key: `summary`,
+    Dictionary: **Dictionary** (pre-formatted by the server: filename on
+    success, error message on failure).
 
 **Step 4 — Notify**
 
-16. Tap **Add Action** → **Show Notification**.
+15. Tap **Add Action** → **Show Notification**.
     - Title: `Margin`
-    - Body: `Saved: ` + **Dictionary Value** + ` ` + **Dictionary Value 2**.
-    - On success you see the filename; on error you see the server's error message.
+    - Body: tap the variable icon → pick **Dictionary Value**.
 
-17. Tap **Done**.
+16. Tap **Done**.
 
 ---
 
@@ -160,6 +151,28 @@ iOS and are only worth building if you can't run the server at all.
 | NetNewsWire / Unread | article link | Save to Margin |
 | Files app | a PDF file | Save PDF to Margin |
 | Safari | a PDF opened in browser | Save PDF to Margin |
+
+---
+
+## Icons and the Home Screen
+
+**Shortcut icon inside the Shortcuts app / Share Sheet:** iOS only allows a
+glyph + background color here, not custom images — tap the shortcut's icon
+while editing to pick them (the bookmark glyph on a red background is a
+reasonable match for Margin).
+
+**Shortcut on the Home Screen with the real Margin icon:** custom images
+*are* allowed there. First save the icon to Photos: open
+`http://SERVER_ADDRESS:8000/static/icon-512.png` in Safari, long-press the
+image → **Add to Photos**. Then: Shortcuts → ⋯ on the shortcut → **Add to
+Home Screen** → tap the icon thumbnail → **Choose Photo** → select it.
+
+**The Margin queue as a Home-Screen app:** open
+`http://SERVER_ADDRESS:8000/` in Safari → Share → **Add to Home Screen**.
+It installs with the Margin icon and opens full-screen like an app. Note:
+the installed app has its own cookie storage, so if the server uses
+`MARGIN_TOKEN` you'll see the token prompt on first launch — enter it once
+and it's remembered.
 
 ---
 

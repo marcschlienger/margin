@@ -134,14 +134,32 @@ _PUBLIC_PATHS = {
     "/manifest.json",
 }
 
+# Shown on unauthenticated browser requests. The form matters for the
+# home-screen web app: standalone mode has no URL bar to type ?token=, and
+# its cookie storage is separate from Safari's, so the token must be
+# enterable in-page (submits as GET /?token=…, which sets the cookie).
 _UNAUTHORIZED_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Margin — unauthorized</title></head>
+<html><head><meta charset="utf-8"><title>Margin — unauthorized</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+</head>
 <body style="font: 16px/1.5 system-ui, sans-serif; max-width: 34rem;
              margin: 4rem auto; padding: 0 1rem;">
-<h1 style="font-size:1.3rem; color:#c62828;">401 — token required</h1>
-<p>This Margin server requires an API token. Open
-<code>/?token=YOUR-TOKEN</code> once to store it in a cookie for this
-browser, or send an <code>Authorization: Bearer</code> header.</p>
+<h1 style="font-size:1.3rem; color:#c62828;">Token required</h1>
+<p>This Margin server requires an API token. Enter it once — it is stored
+in a browser cookie afterwards. (API clients: send an
+<code>Authorization: Bearer</code> header instead.)</p>
+<form method="get" action="/" style="display:flex; gap:.5rem;">
+  <input type="password" name="token" placeholder="API token" required
+         autocomplete="current-password"
+         style="flex:1; font:inherit; padding:.45rem .6rem;
+                border:1px solid #999; border-radius:6px;">
+  <button type="submit" style="font:inherit; padding:.45rem .9rem;
+          border:1px solid #999; border-radius:6px; cursor:pointer;">
+    Unlock</button>
+</form>
 </body></html>"""
 
 
@@ -169,7 +187,8 @@ async def _require_token(request: Request, call_next):
         return JSONResponse(
             {"status": "error", "filename": "",
              "message": "Unauthorized: missing or wrong token "
-                        "(Authorization: Bearer header or ?token= parameter)"},
+                        "(Authorization: Bearer header or ?token= parameter)",
+             "summary": "Error: missing or wrong API token"},
             status_code=401,
         )
 
@@ -807,8 +826,13 @@ async def _mathpix_pdf(pdf_bytes: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 def _err(msg: str) -> dict:
-    """Uniform error shape — keeps HTTP 200 so iOS Shortcuts can surface the message."""
-    return {"status": "error", "filename": "", "message": msg}
+    """Uniform error shape — keeps HTTP 200 so iOS Shortcuts can surface the message.
+
+    `summary` is a ready-made one-liner so a Shortcut needs a single
+    Get-Dictionary-Value action for its notification.
+    """
+    return {"status": "error", "filename": "", "message": msg,
+            "summary": f"Error: {msg}"}
 
 
 def _clean_shortcut_url(v: str) -> str:
@@ -886,6 +910,7 @@ def _ok(md_path: Path, title: str) -> dict:
         "filename": md_path.name,
         "title": title,
         "path": str(md_path),
+        "summary": f"Saved: {md_path.name}",
     }
 
 
@@ -1021,6 +1046,7 @@ def _duplicate_response(existing: dict) -> dict:
         "path": str(OUTPUT_DIR),
         "message": f"Already saved ({existing['files'][0]}) — "
                    'send "force": true to save again',
+        "summary": f"Already saved: {existing['files'][0]}",
     }
 
 
@@ -1143,6 +1169,7 @@ async def _run_markdown_save(
         "files": [p.name for p in written],
         "title": title,
         "path": str(written[0]),
+        "summary": f"Saved: {written[0].name}",
     }
 
 
@@ -1229,6 +1256,7 @@ async def save(payload: SavePayload, request: Request):
         "title": title,
         "files": saved,
         "path": str(OUTPUT_DIR),
+        "summary": f"Saved: {', '.join(saved)}",
         **({"warnings": errors} if errors else {}),
     }
 
