@@ -363,6 +363,8 @@ def test_reader_renders_markdown_with_math(tmp_path, monkeypatch):
     assert "<h1>Heading</h1>" in r.text
     assert "$a_i + b_j$" in r.text          # math untouched (no <em> mangling)
     assert "alert(1)" not in r.text
+    # Download must be JS-driven (no page navigation in the standalone app)
+    assert 'id="download"' in r.text and "preventDefault" in r.text
     assert "← Inbox" in r.text and "mathjax" in r.text.lower()
 
 

@@ -1764,7 +1764,7 @@ __HEAD_ICONS__
   <span class="name">__TITLE__</span>
   <button id="share" hidden>Share</button>
   <button id="copy" hidden>Copy</button>
-  <a class="btn" href="/files/__NAME__?download=1">Download</a>
+  <a class="btn" id="download" href="/files/__NAME__?download=1">Download</a>
 </header>
 <main>__CONTENT__</main>
 <script>
@@ -1788,6 +1788,23 @@ if (navigator.canShare) {
     } catch (e) { /* user cancelled */ }
   };
 }
+// Download without navigating: a plain link would replace this page with
+// the attachment URL — in the home-screen app (no browser chrome) that
+// strands the user with no way back. Fetch → blob → synthetic <a download>
+// keeps the reader in place; the href stays as a no-JS fallback.
+document.getElementById('download').addEventListener('click', async (e) => {
+  e.preventDefault();
+  const blob = await fileBlob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = NAME;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+});
+
 const copyBtn = document.getElementById('copy');
 if (IS_TEXT && navigator.clipboard) {
   copyBtn.hidden = false;
