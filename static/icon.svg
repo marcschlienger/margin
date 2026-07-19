@@ -13,9 +13,10 @@
   </g>
   <!-- Asterisk sized for ~2 units of clear air before the rule at x=20.25
        (tips + round caps reach x=18.2) — touching would fuse the shapes.
-       Red, not ink: iOS auto-darkens the tile for dark home-screen icons,
-       where near-black would vanish; mid-luminance red survives both. -->
-  <g stroke="#C43D33" stroke-width="4" stroke-linecap="round">
+       Blue ink: mid-luminance (survives iOS's auto-darkened home-screen
+       icons, unlike near-black) and distinct from both the red rule and
+       the slate text — a reader's pen, not the page's printing. -->
+  <g stroke="#3D6BB3" stroke-width="4" stroke-linecap="round">
     <line x1="11.5" y1="18.5" x2="11.5" y2="29.5"/>
     <line x1="6.8" y1="21.25" x2="16.2" y2="26.75"/>
     <line x1="16.2" y1="21.25" x2="6.8" y2="26.75"/>
