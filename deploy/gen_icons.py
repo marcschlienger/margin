@@ -22,9 +22,12 @@ REPO = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().pare
 SIZES = [
     (180, "apple-touch-icon.png", False),
     (512, "icon-512.png", False),
+    (192, "icon-192.png", False),
     (32, "favicon-32.png", True),
     (16, "favicon-16.png", True),
 ]
+
+PAPER = "#F0E7D2"  # keep in sync with the <rect> fill in icon.svg
 
 svg = (REPO / "static" / "icon.svg").read_text(encoding="utf-8")
 svg_square = re.sub(r'rx="14"', 'rx="0"', svg)
@@ -46,6 +49,25 @@ with sync_playwright() as p:
                         omit_background=rounded)
         page.close()
         print(f"wrote static/{name} ({size}x{size})")
+
+    # Maskable PWA variant: Android applies a circle/squircle mask, so all
+    # critical content must sit in the central 80% — render the (rounded)
+    # artwork scaled to 80% on a full-bleed paper background.
+    size, inner = 512, 410  # inner = 80% safe zone
+    pad = (size - inner) // 2
+    page = browser.new_page(viewport={"width": size, "height": size})
+    page.set_content(
+        f"<body style='margin:0;background:{PAPER}'>"
+        f"<div style='padding:{pad}px'>"
+        f"<div style='width:{inner}px;height:{inner}px'>{svg}</div></div></body>"
+    )
+    page.locator("svg").evaluate(
+        "el => { el.setAttribute('width','100%'); el.setAttribute('height','100%'); }"
+    )
+    page.screenshot(path=str(REPO / "static" / "icon-512-maskable.png"),
+                    clip={"x": 0, "y": 0, "width": size, "height": size})
+    page.close()
+    print("wrote static/icon-512-maskable.png (512x512, 80% safe zone)")
     browser.close()
 
 # Bundle a real .ico (16 + 32) — Safari distrusts non-ICO /favicon.ico content.

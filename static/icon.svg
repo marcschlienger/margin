@@ -1,19 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- Margin: a page, its red margin rule, and a note in the margin -->
+  <!-- Margin: a page, its red margin rule, and a note in the margin.
+       Few bold shapes, no thin lines — must survive 16x16 (Apple HIG). -->
   <rect width="64" height="64" rx="14" fill="#F0E7D2"/>
   <rect x="1.25" y="1.25" width="61.5" height="61.5" rx="12.9"
         fill="none" stroke="#3D4457" stroke-width="2.5"/>
-  <line x1="22" y1="6" x2="22" y2="58" stroke="#C43D33" stroke-width="3"/>
-  <g stroke="#5D6883" stroke-width="3.6" stroke-linecap="round">
-    <line x1="28" y1="16" x2="54" y2="16"/>
-    <line x1="28" y1="25" x2="50" y2="25"/>
-    <line x1="28" y1="34" x2="54" y2="34"/>
-    <line x1="28" y1="43" x2="46" y2="43"/>
-    <line x1="28" y1="52" x2="52" y2="52"/>
+  <line x1="22" y1="7" x2="22" y2="57" stroke="#C43D33" stroke-width="3.5"/>
+  <g stroke="#5D6883" stroke-width="5" stroke-linecap="round">
+    <line x1="29" y1="18" x2="53" y2="18"/>
+    <line x1="29" y1="32" x2="47" y2="32"/>
+    <line x1="29" y1="46" x2="52" y2="46"/>
   </g>
-  <g stroke="#1C2233" stroke-width="3.4" stroke-linecap="round">
-    <line x1="13" y1="20" x2="13" y2="30"/>
-    <line x1="8.7" y1="22.5" x2="17.3" y2="27.5"/>
-    <line x1="17.3" y1="22.5" x2="8.7" y2="27.5"/>
+  <g stroke="#1C2233" stroke-width="4" stroke-linecap="round">
+    <line x1="13" y1="17" x2="13" y2="31"/>
+    <line x1="7" y1="20.5" x2="19" y2="27.5"/>
+    <line x1="19" y1="20.5" x2="7" y2="27.5"/>
   </g>
 </svg>

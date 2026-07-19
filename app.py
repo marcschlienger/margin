@@ -1306,9 +1306,12 @@ async def apple_touch_icon():
     return FileResponse(_STATIC_DIR / "apple-touch-icon.png")
 
 
-@app.get("/static/icon-512.png", include_in_schema=False)
-async def icon_512():
-    return FileResponse(_STATIC_DIR / "icon-512.png")
+@app.get("/static/{name}", include_in_schema=False)
+async def static_file(name: str):
+    path = _STATIC_DIR / name
+    if "/" in name or "\\" in name or name.startswith(".") or not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path)
 
 
 @app.get("/manifest.json", include_in_schema=False)
