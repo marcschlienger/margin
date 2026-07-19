@@ -134,9 +134,17 @@ original source, a quick-save box (with per-format checkboxes — PDF,
 Markdown, LaTeX, Org — that remember your last choice), a client-side title
 filter, and an
 **Archive** button that moves an item's files into an `archive/` subfolder
-(with a restore view at `/?view=archive`). Follows the system light/dark
-theme. With this, any browser is a functional read-later front end — no notes
-app or third-party service required.
+(with a restore view at `/?view=archive`). The archive view also offers
+permanent **Delete** (confirmation prompt; removes all of an item's files
+and its duplicate-index entry) — deletion is deliberately two-step: inbox →
+archive → delete. Follows the system light/dark theme. With this, any
+browser is a functional read-later front end — no notes app or third-party
+service required.
+
+The queue is a **live view of the folder** — there is no separate database.
+Deleting, moving, or adding files by hand (file manager, `rm`, a sync
+client) is equally valid: the queue reflects it on the next reload, and the
+duplicate index ignores entries whose files are gone.
 
 File links open in a built-in **reader** (`GET /read/{name}`): a page with
 back-to-queue navigation, a **Share** button (native share sheet with the

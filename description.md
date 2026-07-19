@@ -184,9 +184,13 @@ whole file attached), Copy, Download; Markdown rendered server-side through
 an allowlist sanitizer with MathJax typesetting math client-side, PDFs
 embedded in an iframe. Supporting endpoints: `GET /files/{name}` serves raw
 saved files (`.pdf/.md/.tex/.org` only, traversal-safe; `?download=1` forces
-attachment), and `POST /archive` (form fields `stem`,
+attachment), `POST /archive` (form fields `stem`,
 `action=archive|restore`) moves an item's files between the output directory
-and its `archive/` subfolder.
+and its `archive/` subfolder, and `POST /delete` (form field `stem`)
+permanently removes an item's files and its duplicate-index entry — exposed
+in the UI only from the archive view, behind a confirmation prompt. The
+queue is a live view of the folder: files deleted or moved externally simply
+disappear from it.
 
 ---
 

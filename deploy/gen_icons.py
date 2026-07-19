@@ -27,7 +27,7 @@ SIZES = [
     (16, "favicon-16.png", True),
 ]
 
-PAPER = "#F0E7D2"  # keep in sync with the <rect> fill in icon.svg
+PAPER = "#EDE2C9"  # keep in sync with the <rect> fill in icon.svg
 
 svg = (REPO / "static" / "icon.svg").read_text(encoding="utf-8")
 svg_square = re.sub(r'rx="14"', 'rx="0"', svg)

@@ -1,9 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <!-- Margin: a page, its red margin rule, and a note in the margin.
        Few bold shapes, no thin lines — must survive 16x16 (Apple HIG). -->
-  <rect width="64" height="64" rx="14" fill="#F0E7D2"/>
-  <rect x="1.25" y="1.25" width="61.5" height="61.5" rx="12.9"
-        fill="none" stroke="#3D4457" stroke-width="2.5"/>
+  <!-- No outline: dark-mode guidance says contrast comes from the tile
+       color itself, not a stroke. Paper is one step deeper than pure cream
+       so it still separates from white/light-gray tab bars. -->
+  <rect width="64" height="64" rx="14" fill="#EDE2C9"/>
   <line x1="22" y1="7" x2="22" y2="57" stroke="#C43D33" stroke-width="3.5"/>
   <g stroke="#5D6883" stroke-width="5" stroke-linecap="round">
     <line x1="29" y1="18" x2="53" y2="18"/>

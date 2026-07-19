@@ -1467,6 +1467,7 @@ __HEAD_ICONS__
   button { font: inherit; font-size: .82rem; padding: .25rem .7rem;
            border: 1px solid var(--muted); border-radius: 6px;
            background: var(--btn); color: inherit; cursor: pointer; }
+  button.danger { color: #c43d33; border-color: #c43d3366; }
   .empty { color: var(--muted); margin-top: 2rem; }
 </style></head>
 <body>
@@ -1583,6 +1584,14 @@ def _item_row(item: dict, view: str) -> str:
         if item["source"] else ""
     )
     action = "restore" if view == "archive" else "archive"
+    # Permanent deletion only from the archive view: inbox → archive → delete
+    # is a deliberate two-step, and the confirm() guards against slips.
+    delete_form = "" if view != "archive" else f"""
+  <form method="post" action="/delete"
+        onsubmit="return confirm('Delete permanently? This cannot be undone.')">
+    <input type="hidden" name="stem" value="{_html_escape(item["stem"])}">
+    <button type="submit" class="danger">Delete</button>
+  </form>"""
     return f"""<div class="item">
   <span class="date">{item["date"]}</span>
   <div class="main">
@@ -1593,7 +1602,7 @@ def _item_row(item: dict, view: str) -> str:
     <input type="hidden" name="stem" value="{_html_escape(item["stem"])}">
     <input type="hidden" name="action" value="{action}">
     <button type="submit">{action.capitalize()}</button>
-  </form>
+  </form>{delete_form}
 </div>"""
 
 
@@ -1828,6 +1837,48 @@ async def read_file(name: str):
             .replace("__CONTENT__", content)
             .replace("__MATHJAX__", mathjax))
     return HTMLResponse(page)
+
+
+def _forget_stem(stem: str) -> None:
+    """Drop a deleted item's stem from the duplicate-URL index."""
+    idx = _load_url_index()
+    changed = False
+    for url in list(idx):
+        if stem in idx[url]:
+            idx[url] = [s for s in idx[url] if s != stem]
+            changed = True
+            if not idx[url]:
+                del idx[url]
+    if changed:
+        try:
+            _url_index_path().write_text(json.dumps(idx, indent=1),
+                                         encoding="utf-8")
+        except OSError as e:
+            _log("index", f"could not write URL index: {e}")
+
+
+@app.post("/delete")
+async def delete_item(stem: str = Form(...)):
+    """Permanently delete all files of one saved item (inbox and archive/).
+
+    The queue UI only offers this from the archive view (inbox → archive →
+    delete, with a confirm prompt), but the endpoint itself removes the stem
+    wherever it lives.
+    """
+    if not _RE_SAFE_STEM.match(stem):
+        raise HTTPException(400, detail="invalid stem")
+    removed = 0
+    for folder in (OUTPUT_DIR, _archive_dir()):
+        if folder.is_dir():
+            for f in list(folder.iterdir()):
+                if f.is_file() and f.stem == stem and f.suffix.lower() in _SERVE_EXTS:
+                    f.unlink()
+                    removed += 1
+    if not removed:
+        raise HTTPException(404, detail=f"no files found for {stem!r}")
+    _forget_stem(stem)
+    _log("delete", f"deleted {stem} ({removed} files)")
+    return RedirectResponse(url="/?view=archive", status_code=303)
 
 
 @app.post("/archive")

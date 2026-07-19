@@ -307,6 +307,40 @@ def test_health_open_and_reports_auth(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Deletion
+# ---------------------------------------------------------------------------
+
+def test_delete_removes_files_and_index_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-z.md").write_text("x", encoding="utf-8")
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "2026-07-19-z.pdf").write_bytes(b"%PDF")
+    app._record_url("https://a.test/z", "2026-07-19-z")
+
+    client = TestClient(app.app)
+    r = client.post("/delete", data={"stem": "2026-07-19-z"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert not (tmp_path / "2026-07-19-z.md").exists()
+    assert not (tmp_path / "archive" / "2026-07-19-z.pdf").exists()
+    assert app._find_existing("https://a.test/z") is None
+    assert app._load_url_index() == {}          # index entry cleaned up
+
+    assert client.post("/delete", data={"stem": "../evil"}).status_code == 400
+    assert client.post("/delete", data={"stem": "2026-07-19-z"}).status_code == 404
+
+
+def test_delete_button_only_in_archive_view(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-a.pdf").write_bytes(b"%PDF")
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "2026-07-19-b.pdf").write_bytes(b"%PDF")
+    client = TestClient(app.app)
+    assert 'action="/delete"' not in client.get("/").text
+    assert 'action="/delete"' in client.get("/?view=archive").text
+
+
+# ---------------------------------------------------------------------------
 # Reader (/read/{name})
 # ---------------------------------------------------------------------------
 
