@@ -3,16 +3,22 @@
 # Licensed under the GNU AGPL v3.0 or later; see the LICENSE file for details.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Install Margin as a systemd service on Ubuntu (20.04+). Run as root:
+# Install the shared Margin platform on Ubuntu (20.04+): application code and
+# virtualenv in APP_DIR, headless-Chromium system libraries, and the margin@
+# systemd template unit. Run as root:
 #
 #   sudo bash deploy/install.sh
 #
-# Idempotent — safe to re-run after pulling updates.
+# Then create one instance per person — the service runs as that user and
+# saves into that user's own (synced) folder:
+#
+#   sudo bash deploy/add-instance.sh <user> <port> [output-dir]
+#
+# Idempotent — safe to re-run after pulling updates; restart instances
+# afterwards with:  systemctl restart 'margin@*'
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/margin}"
-OUTPUT_DIR="${OUTPUT_DIR:-/var/lib/margin/inbox}"
-SERVICE_USER="${SERVICE_USER:-margin}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -26,18 +32,14 @@ apt-get install -y python3-venv python3-pip rsync
 # Pandoc is optional (companion .tex/.org files); ignore failure on minimal repos
 apt-get install -y pandoc || echo "pandoc not installed — .tex/.org output will be skipped"
 
-echo "==> Creating service user '$SERVICE_USER'"
-if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-  # Real home dir: Playwright stores its Chromium build in ~/.cache
-  useradd --system --create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-fi
-
 echo "==> Copying application to $APP_DIR"
-mkdir -p "$APP_DIR" "$OUTPUT_DIR"
+mkdir -p "$APP_DIR"
 rsync -a --delete \
   --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
   --exclude '.env' --exclude 'server.log' \
   "$REPO_DIR/" "$APP_DIR/"
+# Shared, instance-independent secrets (Mathpix credentials) live here;
+# per-person settings (port, output dir, token) live in /etc/margin/<user>.env
 [ -f "$APP_DIR/.env" ] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
 
 echo "==> Creating virtualenv and installing Python dependencies"
@@ -45,32 +47,20 @@ echo "==> Creating virtualenv and installing Python dependencies"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip -q
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
 
-echo "==> Installing headless Chromium (+ system dependencies) for Playwright"
-# --with-deps needs root; the browser itself must belong to the service user
+echo "==> Installing Chromium system dependencies (browser itself installs per instance)"
 "$APP_DIR/.venv/bin/playwright" install-deps chromium
-sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/playwright" install chromium
 
-echo "==> Setting ownership"
-# Only the app dir and the output dir itself — never the output dir's parent,
-# which may hold unrelated services' data.
-chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR" "$OUTPUT_DIR"
+# Instances run as their own users — they need read access to the shared code
+chmod -R a+rX "$APP_DIR"
 
-echo "==> Installing systemd unit"
-sed -e "s|/var/lib/margin/inbox|$OUTPUT_DIR|g" \
-    -e "s|/opt/margin|$APP_DIR|g" \
-    -e "s|^User=.*|User=$SERVICE_USER|" \
-    -e "s|^Group=.*|Group=$SERVICE_USER|" \
-    "$REPO_DIR/deploy/margin.service" \
-    > /etc/systemd/system/margin.service
+echo "==> Installing systemd template unit margin@.service"
+mkdir -p /etc/margin
+sed "s|/opt/margin|$APP_DIR|g" "$REPO_DIR/deploy/margin@.service" \
+  > /etc/systemd/system/margin@.service
 systemctl daemon-reload
-systemctl enable --now margin
 
-sleep 2
-systemctl --no-pager status margin || true
 echo
-echo "Done. Verify with:  curl http://localhost:8000/health"
-echo "Saved files land in: $OUTPUT_DIR"
-echo "Logs:               journalctl -u margin -f"
-echo
-echo "Optional hardening: set MARGIN_TOKEN in $APP_DIR/.env (see .env.example)"
-echo "and 'systemctl restart margin' to require an API token on all endpoints."
+echo "Platform installed. Create an instance per person, e.g.:"
+echo "  sudo bash $REPO_DIR/deploy/add-instance.sh ${SUDO_USER:-<user>} 8000"
+echo "Existing instances keep running; pick up this update with:"
+echo "  systemctl restart 'margin@*'"

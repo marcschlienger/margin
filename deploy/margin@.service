@@ -1,0 +1,23 @@
+[Unit]
+Description=Margin — read-later server (instance %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/margin
+# Per-person settings: PORT, OUTPUT_DIR, MARGIN_TOKEN
+EnvironmentFile=/etc/margin/%i.env
+ExecStart=/opt/margin/.venv/bin/python app.py
+Restart=on-failure
+RestartSec=5
+
+# Hardening — kept moderate: headless Chromium needs /dev/shm and the user's
+# home (browser cache in ~/.cache/ms-playwright, saves in OUTPUT_DIR).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

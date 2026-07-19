@@ -267,7 +267,7 @@ special-casing, no port forwarding, no dynamic DNS.
   it with a real TLS certificate:
 
   ```bash
-  # in /etc/systemd/system/margin.service: ExecStart ... --host 127.0.0.1
+  # in /etc/margin/<user>.env: HOST=127.0.0.1
   sudo systemctl daemon-reload && sudo systemctl restart margin
   sudo tailscale serve --bg 8000
   ```
@@ -308,33 +308,48 @@ For auto-start at login on macOS, `start.sh` is a launchd-friendly wrapper
 
 ### Ubuntu server (systemd)
 
-From a checkout on the server:
+Margin is single-user by design, so the deployment model is **one instance
+per person**: each instance runs as that person's own Unix account, saves
+into that person's own (synced) folder, and has its own port, token, reading
+queue, and duplicate index. From a checkout on the server:
 
 ```bash
-sudo bash deploy/install.sh
+sudo bash deploy/install.sh                    # shared platform (once)
+sudo bash deploy/add-instance.sh marc 8000     # one line per person
+sudo bash deploy/add-instance.sh anna 8001
 ```
 
-The installer is idempotent and: installs `python3-venv`/`pandoc`, creates a
-`margin` system user, copies the app to `/opt/margin`, builds the venv,
-installs headless Chromium **with its system dependencies**, writes output to
-`/var/lib/margin/inbox`, and enables the `margin` systemd service
-([deploy/margin.service](deploy/margin.service)). Defaults are overridable:
-
-```bash
-sudo APP_DIR=/opt/margin OUTPUT_DIR=/srv/margin/inbox SERVICE_USER=margin \
-  bash deploy/install.sh
-```
+`install.sh` sets up the shared parts — code and venv in `/opt/margin`,
+Chromium system libraries, and the [margin@.service](deploy/margin@.service)
+systemd template. `add-instance.sh <user> <port> [output-dir]` writes
+`/etc/margin/<user>.env` (output dir defaults to
+`/home/<user>/ReadLater/inbox`; a `MARGIN_TOKEN` is generated and printed),
+installs headless Chromium into that user's cache, and enables
+`margin@<user>`. Both are idempotent.
 
 Day-2 operations:
 
 ```bash
-systemctl status margin
-journalctl -u margin -f
-sudo systemctl restart margin        # e.g. after editing /opt/margin/.env
+systemctl status margin@marc
+journalctl -u margin@marc -f
+sudoedit /etc/margin/marc.env && sudo systemctl restart margin@marc
+sudo bash deploy/install.sh && sudo systemctl restart 'margin@*'   # upgrade
 ```
 
+Shared, instance-independent secrets (Mathpix credentials) go in
+`/opt/margin/.env`; everything per-person (port, output dir, token) lives in
+`/etc/margin/<user>.env`.
+
+> **Upgrading from the pre-template layout** (single `margin.service` with a
+> dedicated `margin` user): stop and remove the old unit
+> (`sudo systemctl disable --now margin && sudo rm
+> /etc/systemd/system/margin.service`), run the two commands above, move the
+> contents of the old inbox — including `archive/` and the hidden
+> `.saved-urls.json` — into the new per-user output dir, and `chown -R` them
+> to that user.
+
 The service listens on all interfaces; run it on a private network (LAN,
-Tailscale, WireGuard) and/or set `MARGIN_TOKEN` — see
+Tailscale, WireGuard) and/or use the per-instance `MARGIN_TOKEN` — see
 [Authentication](#authentication-optional) and
 [Remote access via Tailscale](#remote-access-via-tailscale) above.
 
@@ -389,7 +404,7 @@ Tailscale, WireGuard) and/or set `MARGIN_TOKEN` — see
 | `app.py` | FastAPI server: endpoints, math extraction, Markdown pipeline |
 | `render.py` | Playwright wrapper: rendered HTML + PDF export, wait logic |
 | `tests/` | Unit tests (`pip install -r requirements-dev.txt && python -m pytest`) |
-| `deploy/` | Ubuntu installer, systemd unit, icon regeneration script |
+| `deploy/` | Ubuntu installer, per-person instance script, systemd template, icon regeneration |
 | `static/` | App icon (SVG master + generated PNGs) and web manifest |
 | `description.md` | Architecture and the seven math-extraction strategies |
 | `shortcut_setup.md` | Step-by-step iOS Shortcut construction |

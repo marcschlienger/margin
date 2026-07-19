@@ -36,9 +36,12 @@ Margin — FastAPI server, port 8000  (Ubuntu, macOS, or any Linux)
                            Nextcloud, or Syncthing, or read via /)
 ```
 
-On Ubuntu the server runs as a systemd service (`deploy/margin.service`,
-installed by `deploy/install.sh`); on macOS it can run as a Launch Agent so it
-starts at login and restarts on crash. Capture happens from iOS via two Apple
+On Ubuntu the server runs under a systemd template unit
+(`deploy/margin@.service`) — one instance per person, each as that person's
+own user with its own port, output folder, and token; `deploy/install.sh`
+installs the shared platform and `deploy/add-instance.sh` creates instances.
+On macOS it can run as a Launch Agent so it starts at login and restarts on
+crash. Capture happens from iOS via two Apple
 Shortcuts (one for URLs, one for PDFs), from desktop browsers via a
 bookmarklet hitting `/save-page`, or from anything that can POST JSON.
 
@@ -50,8 +53,9 @@ bookmarklet hitting `/save-page`, or from anything that can POST JSON.
 |---|---|
 | `app.py` | FastAPI server — endpoints, extraction and conversion logic |
 | `render.py` | Headless-Chromium rendering (Playwright): rendered HTML + PDF export |
-| `deploy/install.sh` | Ubuntu installer — venv, Chromium, systemd service |
-| `deploy/margin.service` | systemd unit for the Ubuntu deployment |
+| `deploy/install.sh` | Ubuntu installer — shared code, venv, Chromium deps, template unit |
+| `deploy/add-instance.sh` | Creates a per-person instance (`margin@<user>`) |
+| `deploy/margin@.service` | systemd template unit for the Ubuntu deployment |
 | `requirements.txt` | Python dependencies |
 | `.env` | Config: Mathpix credentials, `OUTPUT_DIR`, `MARGIN_TOKEN` |
 | `.env.example` | Template for `.env` — copy to `.env` and fill in |
@@ -406,10 +410,11 @@ if you cannot run the server.
 .venv/bin/python app.py --host 0.0.0.0 --port 8000 [--output-dir DIR]
 ```
 
-**Ubuntu — systemd service** (installed by `deploy/install.sh`):
+**Ubuntu — systemd template** (installed by `deploy/install.sh` +
+`deploy/add-instance.sh <user> <port>`):
 ```bash
-systemctl status margin
-journalctl -u margin -f          # logs
+systemctl status margin@<user>
+journalctl -u margin@<user> -f   # logs
 ```
 
 **macOS — Launch Agent (auto-starts at login):**
