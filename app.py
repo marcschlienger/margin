@@ -37,6 +37,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from datetime import date
 from html import escape as _html_escape
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -66,6 +67,11 @@ try:
     from pypdf import PdfReader
 except ModuleNotFoundError:  # optional — only used for direct-PDF titles
     PdfReader = None
+
+try:
+    import markdown as _markdown
+except ModuleNotFoundError:  # optional — reader falls back to raw text
+    _markdown = None
 
 load_dotenv()
 
@@ -1565,8 +1571,11 @@ def _list_items(folder: Path) -> list[dict]:
 
 
 def _item_row(item: dict, view: str) -> str:
+    # Links go through /read/ (reader page with back-nav and share), not the
+    # raw file — essential in the home-screen web app, which has no browser
+    # chrome to navigate back with.
     file_links = "".join(
-        f'<a href="/files/{_html_escape(f.name)}">{f.suffix[1:]}</a> '
+        f'<a href="/read/{_html_escape(f.name)}">{f.suffix[1:]}</a> '
         for f in item["files"]
     )
     source = (
@@ -1577,7 +1586,7 @@ def _item_row(item: dict, view: str) -> str:
     return f"""<div class="item">
   <span class="date">{item["date"]}</span>
   <div class="main">
-    <a class="title" href="/files/{_html_escape(item["files"][0].name)}">{_html_escape(item["title"])}</a>
+    <a class="title" href="/read/{_html_escape(item["files"][0].name)}">{_html_escape(item["title"])}</a>
     <div class="links">{file_links}{source}</div>
   </div>
   <form method="post" action="/archive">
@@ -1607,9 +1616,8 @@ async def index(view: str = "inbox"):
     return HTMLResponse(html)
 
 
-@app.get("/files/{name}")
-async def get_file(name: str):
-    """Serve a saved file from the output dir (or its archive/ subfolder)."""
+def _resolve_saved_file(name: str) -> Path:
+    """Locate `name` in the output dir or archive/; 404 on miss/unsafe names."""
     if "/" in name or "\\" in name or name.startswith(".") or \
             Path(name).suffix.lower() not in _SERVE_EXTS:
         raise HTTPException(404)
@@ -1618,7 +1626,208 @@ async def get_file(name: str):
         path = _archive_dir() / name
     if not path.is_file():
         raise HTTPException(404)
+    return path
+
+
+@app.get("/files/{name}")
+async def get_file(name: str, download: bool = False):
+    """Serve a saved file; ?download=1 forces a download (attachment)."""
+    path = _resolve_saved_file(name)
+    if download:
+        return FileResponse(path, filename=name)
     return FileResponse(path)
+
+
+# ---------------------------------------------------------------------------
+# Reader — /read/{name} wraps a saved file in a page with back-navigation and
+# native share/copy/download. Needed most in the home-screen web app, where
+# navigating to a raw file would strand the user (no browser chrome).
+# ---------------------------------------------------------------------------
+
+_ALLOWED_TAGS = {
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "em", "strong", "b", "i", "u",
+    "s", "del", "code", "pre", "ul", "ol", "li", "blockquote", "hr", "br",
+    "a", "sup", "sub", "table", "thead", "tbody", "tr", "th", "td",
+}
+
+
+class _HTMLSanitizer(HTMLParser):
+    """Allowlist filter for rendered Markdown: keeps structural tags, drops
+    scripts/styles (including their content), event handlers, and every
+    attribute except http(s)/# hrefs. Saved pages come from arbitrary
+    websites, so their Markdown must not inject markup into the reader."""
+
+    def __init__(self):
+        super().__init__()
+        self.out: list[str] = []
+        self._skip: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip = tag
+            return
+        if self._skip or tag not in _ALLOWED_TAGS:
+            return
+        if tag == "a":
+            href = next((v for k, v in attrs if k == "href"), "") or ""
+            if href.startswith(("http://", "https://", "#")):
+                self.out.append(f'<a href="{_html_escape(href)}" rel="noopener">')
+                return
+        self.out.append(f"<{tag}>")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag == self._skip:
+            self._skip = None
+        elif not self._skip and tag in _ALLOWED_TAGS and tag not in ("br", "hr"):
+            self.out.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.out.append(_html_escape(data))
+
+
+def _sanitize_html(html: str) -> str:
+    s = _HTMLSanitizer()
+    s.feed(html)
+    s.close()
+    return "".join(s.out)
+
+
+def _render_markdown(text: str) -> str:
+    """Markdown → sanitized HTML. Math spans are stashed before conversion so
+    Markdown can't mangle them (e.g. underscores → <em>), then restored as
+    escaped text for MathJax to typeset client-side."""
+    stash: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        stash.append(m.group(0))
+        return f"§MATH{len(stash) - 1}§"
+
+    text = _RE_MATH_SPAN.sub(_stash, text)
+    html = _sanitize_html(_markdown.markdown(text, extensions=["extra"]))
+    for i, m in enumerate(stash):
+        html = html.replace(f"§MATH{i}§", _html_escape(m))
+    return html
+
+
+# MathJax from CDN — only loaded on .md reader pages; without internet the
+# page still works, math just stays as $...$ source.
+_MATHJAX_SNIPPET = """<script>
+MathJax = { tex: { inlineMath: [['$','$']], displayMath: [['$$','$$']] } };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>"""
+
+_READ_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>__TITLE__ — Margin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+__HEAD_ICONS__
+<style>
+  :root { color-scheme: light dark; --muted: #8a8a8e; --line: #88888833; }
+  body { font: 17px/1.6 -apple-system, system-ui, sans-serif;
+         max-width: 44rem; margin: 0 auto; padding: 0 1rem 3rem; }
+  header { display: flex; gap: .7rem; align-items: center;
+           padding: .7rem 0; border-bottom: 1px solid var(--line);
+           position: sticky; top: 0; background: Canvas; }
+  header a.back { text-decoration: none; white-space: nowrap; }
+  header .name { flex: 1; font-size: .82rem; color: var(--muted);
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  header button, header a.btn {
+    font: inherit; font-size: .82rem; padding: .3rem .7rem;
+    border: 1px solid var(--muted); border-radius: 6px;
+    background: transparent; color: inherit; cursor: pointer;
+    text-decoration: none; white-space: nowrap; }
+  main { margin-top: 1.2rem; }
+  main pre { white-space: pre-wrap; word-break: break-word; font-size: .85em; }
+  main code { background: #88888822; padding: .1em .3em; border-radius: 4px; }
+  main pre code { background: none; padding: 0; }
+  main blockquote { border-left: 3px solid var(--line); margin-left: 0;
+                    padding-left: 1rem; color: var(--muted); }
+  iframe.pdf { width: 100%; height: 85vh; border: 1px solid var(--line);
+               border-radius: 6px; }
+  .note { color: var(--muted); font-size: .85rem; }
+</style></head>
+<body>
+<header>
+  <a class="back" href="/">← Inbox</a>
+  <span class="name">__TITLE__</span>
+  <button id="share" hidden>Share</button>
+  <button id="copy" hidden>Copy</button>
+  <a class="btn" href="/files/__NAME__?download=1">Download</a>
+</header>
+<main>__CONTENT__</main>
+<script>
+const NAME = __NAME_JSON__;
+const FILE_URL = '/files/' + encodeURIComponent(NAME);
+const IS_TEXT = __IS_TEXT__;
+async function fileBlob() { return await (await fetch(FILE_URL)).blob(); }
+
+const shareBtn = document.getElementById('share');
+if (navigator.canShare) {
+  shareBtn.hidden = false;
+  shareBtn.onclick = async () => {
+    const blob = await fileBlob();
+    const file = new File([blob], NAME, { type: blob.type });
+    try {
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: NAME });
+      } else {
+        await navigator.share({ title: NAME, url: location.href });
+      }
+    } catch (e) { /* user cancelled */ }
+  };
+}
+const copyBtn = document.getElementById('copy');
+if (IS_TEXT && navigator.clipboard) {
+  copyBtn.hidden = false;
+  copyBtn.onclick = async () => {
+    const blob = await fileBlob();
+    await navigator.clipboard.writeText(await blob.text());
+    copyBtn.textContent = 'Copied!';
+    setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+  };
+}
+</script>
+__MATHJAX__
+</body></html>"""
+
+
+@app.get("/read/{name}", response_class=HTMLResponse)
+async def read_file(name: str):
+    """Reader page: back link, Share (native sheet via Web Share API), Copy,
+    Download; Markdown rendered server-side with MathJax typesetting."""
+    path = _resolve_saved_file(name)
+    ext = path.suffix.lower()
+    mathjax = ""
+
+    if ext == ".pdf":
+        content = (
+            f'<iframe class="pdf" src="/files/{_html_escape(name)}"></iframe>'
+            '<p class="note">If only the first page shows (an iOS iframe '
+            'limitation), use Share or Download for the full document.</p>'
+        )
+        is_text = "false"
+    else:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
+        if ext == ".md" and _markdown is not None:
+            content = _render_markdown(body)
+            mathjax = _MATHJAX_SNIPPET
+        else:
+            content = f"<pre>{_html_escape(body)}</pre>"
+        is_text = "true"
+
+    page = (_READ_HTML
+            .replace("__HEAD_ICONS__", _HEAD_ICONS)
+            .replace("__NAME_JSON__", json.dumps(name))  # before __NAME__!
+            .replace("__NAME__", _html_escape(name))
+            .replace("__TITLE__", _html_escape(name))
+            .replace("__IS_TEXT__", is_text)
+            .replace("__CONTENT__", content)
+            .replace("__MATHJAX__", mathjax))
+    return HTMLResponse(page)
 
 
 @app.post("/archive")

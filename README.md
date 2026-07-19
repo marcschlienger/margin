@@ -138,9 +138,18 @@ filter, and an
 theme. With this, any browser is a functional read-later front end — no notes
 app or third-party service required.
 
-Supporting endpoints: `GET /files/{name}` serves saved files (inbox or
-archive; only `.pdf/.md/.tex/.org`, no path traversal), and `POST /archive`
-(form fields `stem`, `action=archive|restore`) moves items.
+File links open in a built-in **reader** (`GET /read/{name}`): a page with
+back-to-queue navigation, a **Share** button (native share sheet with the
+whole file attached, via the Web Share API — works in the home-screen app),
+**Copy** and **Download**. Markdown is rendered server-side (sanitized) with
+MathJax typesetting the math client-side (CDN — without internet the math
+shows as `$...$` source); PDFs embed inline. This matters most in the
+home-screen web app, which has no browser chrome to navigate back with.
+
+Supporting endpoints: `GET /files/{name}` serves raw saved files (inbox or
+archive; only `.pdf/.md/.tex/.org`, no path traversal; `?download=1` forces
+an attachment), and `POST /archive` (form fields `stem`,
+`action=archive|restore`) moves items.
 
 ### `GET /save-page` — bookmarklet target
 

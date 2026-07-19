@@ -307,6 +307,49 @@ def test_health_open_and_reports_auth(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Reader (/read/{name})
+# ---------------------------------------------------------------------------
+
+def test_sanitizer_strips_scripts_and_attrs():
+    dirty = ('<p onclick="evil()">hi</p><script>steal()</script>'
+             '<a href="javascript:x">l</a><a href="https://a.test/">ok</a>')
+    clean = app._sanitize_html(dirty)
+    assert "<p>hi</p>" in clean
+    assert "steal" not in clean and "onclick" not in clean
+    assert 'href="https://a.test/"' in clean and "javascript:" not in clean
+
+
+def test_reader_renders_markdown_with_math(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-r.md").write_text(
+        '---\ntitle: "R"\n---\n# Heading\n\nInline $a_i + b_j$ math.\n'
+        "<script>alert(1)</script>\n", encoding="utf-8")
+    r = TestClient(app.app).get("/read/2026-07-19-r.md")
+    assert r.status_code == 200
+    assert "<h1>Heading</h1>" in r.text
+    assert "$a_i + b_j$" in r.text          # math untouched (no <em> mangling)
+    assert "alert(1)" not in r.text
+    assert "← Inbox" in r.text and "mathjax" in r.text.lower()
+
+
+def test_reader_pdf_wraps_iframe(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-p.pdf").write_bytes(b"%PDF")
+    r = TestClient(app.app).get("/read/2026-07-19-p.pdf")
+    assert '<iframe class="pdf" src="/files/2026-07-19-p.pdf">' in r.text
+
+
+def test_files_download_disposition(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-d.md").write_text("x", encoding="utf-8")
+    client = TestClient(app.app)
+    plain = client.get("/files/2026-07-19-d.md")
+    forced = client.get("/files/2026-07-19-d.md?download=1")
+    assert "attachment" not in plain.headers.get("content-disposition", "")
+    assert "attachment" in forced.headers.get("content-disposition", "")
+
+
+# ---------------------------------------------------------------------------
 # Renderer heuristics
 # ---------------------------------------------------------------------------
 

@@ -178,10 +178,15 @@ top-level navigation is always allowed. The tab closes itself on success.
 Lists every saved item in the output directory: date, title (from Markdown
 frontmatter when present), links to each file and the original source, a
 quick-save form, and per-item Archive buttons. `/?view=archive` shows archived
-items with Restore buttons. Supporting endpoints: `GET /files/{name}` serves
-saved files (`.pdf/.md/.tex/.org` only, traversal-safe), and `POST /archive`
-(form fields `stem`, `action=archive|restore`) moves an item's files between
-the output directory and its `archive/` subfolder.
+items with Restore buttons. File links open in the built-in reader
+(`GET /read/{name}`): back-to-queue navigation, native Share (Web Share API,
+whole file attached), Copy, Download; Markdown rendered server-side through
+an allowlist sanitizer with MathJax typesetting math client-side, PDFs
+embedded in an iframe. Supporting endpoints: `GET /files/{name}` serves raw
+saved files (`.pdf/.md/.tex/.org` only, traversal-safe; `?download=1` forces
+attachment), and `POST /archive` (form fields `stem`,
+`action=archive|restore`) moves an item's files between the output directory
+and its `archive/` subfolder.
 
 ---
 
