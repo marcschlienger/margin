@@ -7,6 +7,8 @@
 Run with:  python -m pytest
 No network, browser, or Mathpix access required.
 """
+import shutil
+
 import pytest
 
 import app
@@ -111,6 +113,33 @@ def test_frontmatter_tags():
 
 def test_yaml_quote_escapes():
     assert app._yaml_quote('a "b" \\c') == '"a \\"b\\" \\\\c"'
+
+
+# ---------------------------------------------------------------------------
+# Output formats
+# ---------------------------------------------------------------------------
+
+def test_formats_validation():
+    p = app.SavePayload(url="https://a.test/x", formats=["PDF", ".tex", "org"])
+    assert p.formats == ["pdf", "tex", "org"]
+    with pytest.raises(ValueError):
+        app.SavePayload(url="https://a.test/x", formats=["docx"])
+
+
+def test_write_all_formats_md_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    written = app._write_all_formats("2026-07-19-t.md", "# T\n\nbody", "T", ("md",))
+    assert [p.suffix for p in written] == [".md"]
+    assert not (tmp_path / "2026-07-19-t.tex").exists()
+    assert not (tmp_path / "2026-07-19-t.org").exists()
+
+
+@pytest.mark.skipif(shutil.which("pandoc") is None, reason="pandoc not installed")
+def test_write_all_formats_tex_without_md(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    written = app._write_all_formats("2026-07-19-t.md", "# T\n\nbody", "T", ("tex",))
+    assert [p.suffix for p in written] == [".tex"]
+    assert not (tmp_path / "2026-07-19-t.md").exists()
 
 
 # ---------------------------------------------------------------------------

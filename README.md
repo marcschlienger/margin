@@ -64,10 +64,11 @@ parameter, or the browser cookie) and answers HTTP 401 without it — see
 ### `POST /save` — save any page (the general endpoint)
 
 ```json
-{ "url": "https://…", "formats": ["pdf", "md"] }
+{ "url": "https://…", "formats": ["pdf", "md", "tex", "org"] }
 ```
 
-`formats` is optional and defaults to `["pdf"]`.
+`formats` is optional (default `["pdf"]`); any subset of `pdf`, `md`, `tex`,
+`org` — each selected independently.
 
 - **`pdf`** — renders the page in headless Chromium and exports A4 PDF with
   screen CSS and backgrounds. The renderer waits, in order: DOM content
@@ -79,7 +80,10 @@ parameter, or the browser cookie) and answers HTTP 401 without it — see
   embedded metadata. Bot-challenge interstitials ("Just a moment…") and
   soft-404 pages are detected by title/status and reported as errors, never
   saved.
-- **`md`** — additionally runs the Markdown pipeline below.
+- **`md`** / **`tex`** / **`org`** — run the Markdown pipeline below and write
+  the selected text formats: `.md` (Markdown, math as LaTeX), `.tex`
+  (compilable LaTeX article), `.org` (Emacs Org-mode). `tex`/`org` are
+  Pandoc-derived and work without `md` selected.
 
 Re-saving a URL that is already in the inbox or archive is skipped: the
 response carries `"duplicate": true` plus the existing files, instead of
@@ -126,7 +130,9 @@ Without credentials the rest of the server works; only this endpoint errors.
 
 A minimal web UI over the output directory: every saved item with its date,
 title (from the Markdown frontmatter when available), links to its files and
-original source, a quick-save box, a client-side title filter, and an
+original source, a quick-save box (with per-format checkboxes — PDF,
+Markdown, LaTeX, Org — that remember your last choice), a client-side title
+filter, and an
 **Archive** button that moves an item's files into an `archive/` subfolder
 (with a restore view at `/?view=archive`). Follows the system light/dark
 theme. With this, any browser is a functional read-later front end — no notes

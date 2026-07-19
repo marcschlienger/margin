@@ -33,6 +33,7 @@ import sys
 import traceback
 import unicodedata
 import secrets
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import date
 from html import escape as _html_escape
@@ -43,7 +44,7 @@ import httpx
 import trafilatura
 from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -371,19 +372,53 @@ def _write_tex(md_path: Path, tex_path: Path, title: str) -> None:
     tex_path.write_text(tex, encoding="utf-8")
 
 
-def _write_all_formats(filename: str, md_content: str, title: str) -> Path:
-    """Write .md (collision-safe), then derive .tex and .org via Pandoc."""
+# Text formats the Markdown pipeline can emit. "tex" and "org" are derived
+# from the Markdown via Pandoc and are selectable independently of "md".
+MD_FORMATS = ("md", "tex", "org")
+
+
+def _write_all_formats(filename: str, md_content: str, title: str,
+                       formats: tuple[str, ...] = MD_FORMATS) -> list[Path]:
+    """Write the requested subset of .md/.tex/.org (collision-safe stem).
+
+    Returns the files actually written — Pandoc-derived ones are skipped
+    silently when Pandoc is unavailable, exactly as before.
+    """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     md_path = _unique_path(OUTPUT_DIR / filename)
-    md_path.write_text(md_content, encoding="utf-8")
+    written: list[Path] = []
 
-    _write_tex(md_path, md_path.with_suffix(".tex"), title)
-    _run_pandoc(
-        [*_PANDOC_FROM, str(md_path), "-o", str(md_path.with_suffix(".org"))],
-        f"org {md_path.name}",
-    )
+    if "md" in formats:
+        md_path.write_text(md_content, encoding="utf-8")
+        written.append(md_path)
+        pandoc_src = md_path
+    else:
+        # Pandoc still needs Markdown input — use a throwaway temp file.
+        tmp = tempfile.NamedTemporaryFile(
+            "w", suffix=".md", delete=False, encoding="utf-8")
+        tmp.write(md_content)
+        tmp.close()
+        pandoc_src = Path(tmp.name)
 
-    return md_path
+    try:
+        if "tex" in formats:
+            tex_path = md_path.with_suffix(".tex")
+            _write_tex(pandoc_src, tex_path, title)
+            if tex_path.exists():
+                written.append(tex_path)
+        if "org" in formats:
+            org_path = md_path.with_suffix(".org")
+            _run_pandoc(
+                [*_PANDOC_FROM, str(pandoc_src), "-o", str(org_path)],
+                f"org {org_path.name}",
+            )
+            if org_path.exists():
+                written.append(org_path)
+    finally:
+        if pandoc_src is not md_path:
+            pandoc_src.unlink(missing_ok=True)
+
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -825,9 +860,12 @@ class SavePayload(BaseModel):
     @classmethod
     def check_formats(cls, v: list[str]) -> list[str]:
         v = [f.lower().lstrip(".") for f in v] or ["pdf"]
-        unknown = set(v) - {"pdf", "md"}
+        unknown = set(v) - {"pdf", *MD_FORMATS}
         if unknown:
-            raise ValueError(f"Unknown formats {sorted(unknown)}; use 'pdf' and/or 'md'")
+            raise ValueError(
+                f"Unknown formats {sorted(unknown)}; "
+                "use any of 'pdf', 'md', 'tex', 'org'"
+            )
         return v
 
 
@@ -1028,8 +1066,11 @@ async def _direct_pdf_title(client: httpx.AsyncClient, url: str,
             or "document")
 
 
-async def _run_markdown_save(url: str, request: Request) -> dict:
-    """Markdown pipeline: fetch, extract content + math, write .md/.tex/.org."""
+async def _run_markdown_save(
+    url: str, request: Request, formats: tuple[str, ...] = MD_FORMATS
+) -> dict:
+    """Markdown pipeline: fetch, extract content + math, write the requested
+    subset of .md/.tex/.org."""
     _log("save-url", f"fetching {url}")
     client: httpx.AsyncClient = request.app.state.client
     renderer: Renderer = request.app.state.renderer
@@ -1086,13 +1127,23 @@ async def _run_markdown_save(url: str, request: Request) -> dict:
 
     md = _frontmatter(title, url, has_math="$" in body) + "\n" + body
     try:
-        md_path = _write_all_formats(_filename(title), md, title)
+        written = _write_all_formats(_filename(title), md, title, formats)
     except Exception as e:
         _log("save-url", f"write failed: {e}\n{traceback.format_exc()}")
         return _err(f"Could not write file: {e}")
-    _log("save-url", f"saved → {md_path.name}")
-    _record_url(url, md_path.stem)
-    return _ok(md_path, title)
+    if not written:
+        # Only possible when just tex/org were requested and Pandoc is absent
+        return _err("Pandoc is required for .tex/.org output but is not "
+                    "installed on the server")
+    _log("save-url", f"saved → {', '.join(p.name for p in written)}")
+    _record_url(url, written[0].stem)
+    return {
+        "status": "ok",
+        "filename": written[0].name,
+        "files": [p.name for p in written],
+        "title": title,
+        "path": str(written[0]),
+    }
 
 
 @app.post("/save-url")
@@ -1160,12 +1211,13 @@ async def save(payload: SavePayload, request: Request):
                 _log("save", f"render failed: {e}\n{traceback.format_exc()}")
                 errors.append(f"Could not render {payload.url}: {e}")
 
-    if "md" in payload.formats:
+    md_formats = tuple(f for f in payload.formats if f in MD_FORMATS)
+    if md_formats:
         # Skip the endpoint's duplicate check — this request already passed it
         # (and the PDF just written above would otherwise count as a duplicate).
-        md_result = await _run_markdown_save(payload.url, request)
+        md_result = await _run_markdown_save(payload.url, request, md_formats)
         if md_result.get("status") == "ok":
-            saved.append(md_result["filename"])
+            saved.extend(md_result["files"])
             title = title or md_result["title"]
         else:
             errors.append(md_result.get("message", "markdown save failed"))
@@ -1208,12 +1260,12 @@ async def save_pdf(file: UploadFile = File(...)):
 
     md = _frontmatter(title, has_math="$" in mmd) + "\n" + mmd
     try:
-        md_path = _write_all_formats(_filename(title), md, title)
+        written = _write_all_formats(_filename(title), md, title)
     except Exception as e:
         _log("save-pdf", f"write failed: {e}\n{traceback.format_exc()}")
         return _err(f"Could not write file: {e}")
-    _log("save-pdf", f"saved → {md_path.name}")
-    return _ok(md_path, title)
+    _log("save-pdf", f"saved → {written[0].name}")
+    return _ok(written[0], title)
 
 
 # ---------------------------------------------------------------------------
@@ -1300,16 +1352,19 @@ def _save_page_response(ok: bool, heading: str, detail: str) -> HTMLResponse:
 
 
 @app.get("/save-page", response_class=HTMLResponse)
-async def save_page(request: Request, url: str = "", formats: str = "pdf",
+async def save_page(request: Request, url: str = "",
+                    formats: list[str] = Query(default=[]),
                     force: bool = False):
     """Desktop-browser capture: open from a bookmarklet, get an HTML result.
 
     A bookmarklet opens this in a new tab (`window.open`). A top-level
     navigation is used instead of fetch() because browsers block fetch from
     an https page to a plain-http LAN server (mixed content), but allow
-    navigating to it. `formats` is comma-separated, e.g. "pdf,md".
+    navigating to it. `formats` accepts repeated parameters
+    (?formats=pdf&formats=md — what the queue form sends) and/or
+    comma-separated values (?formats=pdf,md — bookmarklet style).
     """
-    fmt_list = [f for f in re.split(r"[\s,]+", formats) if f]
+    fmt_list = [f for part in formats for f in re.split(r"[\s,]+", part) if f]
     try:
         payload = SavePayload(url=url, formats=fmt_list or ["pdf"], force=force)
     except ValueError as e:
@@ -1348,13 +1403,19 @@ __HEAD_ICONS__
          max-width: 46rem; margin: 3rem auto; padding: 0 1rem; }
   h1 { font-size: 1.4rem; }
   h1 a { color: inherit; text-decoration: none; }
-  form.saver { display: flex; gap: .6rem; align-items: center;
-               margin: 1rem 0 .8rem; flex-wrap: wrap; }
+  form.saver { margin: 1rem 0 .8rem; }
+  form.saver .row { display: flex; gap: .6rem; align-items: center; }
   form.saver input[type=url], #filter {
     flex: 1; min-width: 14rem; font: inherit; padding: .45rem .6rem;
     border: 1px solid var(--muted); border-radius: 6px;
     background: transparent; color: inherit; }
-  form.saver label { font-size: .85rem; white-space: nowrap; }
+  details.formats { margin-top: .5rem; font-size: .85rem; }
+  details.formats summary { cursor: pointer; color: var(--muted); }
+  details.formats summary b { color: inherit; font-weight: 500; }
+  .fmt-list { display: flex; flex-direction: column; gap: .35rem;
+              margin: .6rem 0 .2rem .2rem; }
+  .fmt-list label { cursor: pointer; }
+  .fmt-list small { color: var(--muted); }
   #filter { margin-bottom: 1rem; display: block; width: 100%;
             box-sizing: border-box; }
   .tabs { margin-bottom: .8rem; font-size: .95rem; }
@@ -1374,10 +1435,23 @@ __HEAD_ICONS__
 <body>
 <h1><a href="/">Margin</a></h1>
 <form class="saver" method="get" action="/save-page">
-  <input type="url" name="url" placeholder="https://…  save a page" required>
-  <label><input type="checkbox" name="formats" value="pdf,md" checked>
-    + Markdown</label>
-  <button type="submit">Save</button>
+  <div class="row">
+    <input type="url" name="url" placeholder="https://…  save a page" required>
+    <button type="submit">Save</button>
+  </div>
+  <details class="formats">
+    <summary>Formats: <b id="fmt-summary"></b></summary>
+    <div class="fmt-list">
+      <label><input type="checkbox" name="formats" value="pdf" checked>
+        PDF <small>— the page exactly as rendered</small></label>
+      <label><input type="checkbox" name="formats" value="md" checked>
+        Markdown <small>— article text, math as LaTeX (.md)</small></label>
+      <label><input type="checkbox" name="formats" value="tex">
+        LaTeX <small>— compilable article (.tex)</small></label>
+      <label><input type="checkbox" name="formats" value="org">
+        Org <small>— Emacs Org-mode (.org)</small></label>
+    </div>
+  </details>
 </form>
 <div class="tabs">
   <a href="/">Inbox (__INBOX_COUNT__)</a>
@@ -1392,6 +1466,26 @@ document.getElementById('filter').addEventListener('input', function () {
     el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
   });
 });
+
+// Format checkboxes: restore last choice, keep the summary line current.
+(function () {
+  const NAMES = { pdf: 'PDF', md: 'Markdown', tex: 'LaTeX', org: 'Org' };
+  const boxes = Array.from(
+    document.querySelectorAll('.fmt-list input[type=checkbox]'));
+  const saved = localStorage.getItem('margin-formats');
+  if (saved !== null) {
+    const picked = saved.split(',');
+    boxes.forEach(b => { b.checked = picked.includes(b.value); });
+  }
+  function update() {
+    const picked = boxes.filter(b => b.checked).map(b => b.value);
+    document.getElementById('fmt-summary').textContent =
+      picked.length ? picked.map(v => NAMES[v]).join(', ') : 'PDF (default)';
+    localStorage.setItem('margin-formats', picked.join(','));
+  }
+  boxes.forEach(b => b.addEventListener('change', update));
+  update();
+})();
 </script>
 </body></html>"""
 

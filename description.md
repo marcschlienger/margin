@@ -89,8 +89,9 @@ only `/save-pdf` returns an error.
 
 ### `POST /save`
 
-**Input:** JSON body `{ "url": "https://...", "formats": ["pdf", "md"] }`
-(`formats` optional, default `["pdf"]`)
+**Input:** JSON body `{ "url": "https://...", "formats": [...] }` —
+`formats` optional (default `["pdf"]`), any subset of `pdf`, `md`, `tex`,
+`org`, each selected independently.
 
 **Process:**
 1. If the URL serves a PDF directly (content type or `.pdf` extension), the
@@ -102,7 +103,9 @@ only `/save-pdf` returns an error.
    and reported as errors instead of being saved.
 4. The rendered page is exported as `YYYY-MM-DD-title-slug.pdf` (screen CSS,
    A4, backgrounds on) into the output directory.
-5. With `"md"` in `formats`, the Markdown pipeline below also runs.
+5. With any of `"md"`, `"tex"`, `"org"` in `formats`, the Markdown pipeline
+   below also runs and writes exactly the selected text formats (`tex`/`org`
+   are derived via Pandoc and don't require `md`).
 
 **Returns:** `{ "status": "ok", "title": "...", "files": [...], "path": "..." }`,
 or `{ "status": "error", "message": "..." }` — always HTTP 200.
