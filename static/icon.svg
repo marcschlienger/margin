@@ -12,8 +12,10 @@
     <line x1="29" y1="46" x2="52" y2="46"/>
   </g>
   <!-- Asterisk sized for ~2 units of clear air before the rule at x=20.25
-       (tips + round caps reach x=18.2) — touching would fuse the shapes. -->
-  <g stroke="#1C2233" stroke-width="4" stroke-linecap="round">
+       (tips + round caps reach x=18.2) — touching would fuse the shapes.
+       Red, not ink: iOS auto-darkens the tile for dark home-screen icons,
+       where near-black would vanish; mid-luminance red survives both. -->
+  <g stroke="#C43D33" stroke-width="4" stroke-linecap="round">
     <line x1="11.5" y1="18.5" x2="11.5" y2="29.5"/>
     <line x1="6.8" y1="21.25" x2="16.2" y2="26.75"/>
     <line x1="16.2" y1="21.25" x2="6.8" y2="26.75"/>
