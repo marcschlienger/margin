@@ -67,8 +67,13 @@ parameter, or the browser cookie) and answers HTTP 401 without it — see
 { "url": "https://…", "formats": ["pdf", "md", "tex", "org"] }
 ```
 
-`formats` is optional (default `["pdf"]`); any subset of `pdf`, `md`, `tex`,
-`org` — each selected independently.
+`formats` is optional; any subset of `pdf`, `md`, `tex`, `org`, each selected
+independently. Omitted, it uses the server default (`DEFAULT_FORMATS`,
+shipping as `pdf,md,tex`) — the *same* default every capture path uses
+(bookmarklet, iOS shortcut, the queue's pre-checked boxes), so a save
+produces the same files however it's triggered. `formats` may also be a
+comma-separated string (`"pdf,md"`), which iOS Shortcuts can send more easily
+than a JSON array.
 
 - **`pdf`** — renders the page in headless Chromium and exports A4 PDF with
   screen CSS and backgrounds. The renderer waits, in order: DOM content
@@ -102,19 +107,23 @@ existed.
 On partial success a `"warnings"` array lists what failed; on total failure
 `"status": "error"` with a `"message"`.
 
-### `POST /save-url` — Markdown pipeline
+### `POST /save-url` — Markdown pipeline only
 
 ```json
 { "url": "https://…" }
 ```
 
-Fetches the raw HTML (fast — MathJax/KaTeX sites ship the LaTeX source in the
-initial HTML), extracts the article with math converted to LaTeX, and writes
-`.md` plus companion `.tex` and `.org` files (via Pandoc, if installed). If
-the plain fetch is bot-blocked (401/403/406/429/503) or the extracted body is
-nearly empty (client-side-rendered app), it automatically retries from the
-fully rendered Chromium DOM. Responds with
-`{"status": "ok", "filename": …, "title": …, "path": …}`.
+The text-only path: no PDF, just the Markdown formats. Fetches the raw HTML
+(fast — MathJax/KaTeX sites ship the LaTeX source in the initial HTML),
+extracts the article with math converted to LaTeX, and writes the text-format
+slice of the default (shipping as `md` + `tex`; Pandoc-derived, skipped if
+Pandoc is absent). If the plain fetch is bot-blocked (401/403/406/429/503) or
+the extracted body is nearly empty (client-side-rendered app), it
+automatically retries from the fully rendered Chromium DOM. Responds with
+`{"status": "ok", "filename": …, "files": […], "title": …, "summary": …}`.
+
+Prefer `POST /save` for new integrations — it's the unified endpoint that can
+also produce the PDF. `/save-url` remains for the pure-text use case.
 
 The URL cleaning tolerates iOS Shortcuts quirks (inserted whitespace,
 duplicated URL); only `http(s)` URLs are accepted.
@@ -206,6 +215,7 @@ Debug helper: echoes method, headers, and parsed body of the request back.
 |---|---|---|
 | Output directory | `--output-dir` flag > `OUTPUT_DIR` env var (both also read from `.env`) | iCloud `ReadLater/inbox` on macOS, `~/ReadLater/inbox` elsewhere |
 | Bind address / port | `--host` / `--port` flags, or `HOST` / `PORT` env vars | `0.0.0.0` / `8000` |
+| Default formats | `DEFAULT_FORMATS` in `.env` (subset of `pdf,md,tex,org`) | `pdf,md,tex` |
 | Mathpix credentials | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` in `.env` | unset — `/save-pdf` disabled |
 | API token | `MARGIN_TOKEN` in `.env` | unset — no authentication |
 

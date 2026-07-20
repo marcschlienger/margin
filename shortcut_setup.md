@@ -56,7 +56,13 @@ iOS and are only worth building if you can't run the server at all.
 
 6. Tap **Add Action** → search for **Get Contents of URL** → tap it.
 7. Tap the blue **URL** field in the action → type your server address:
-   `http://SERVER_ADDRESS:8000/save-url`
+   `http://SERVER_ADDRESS:8000/save`
+   (This is the unified endpoint — it produces the server's default formats,
+   `pdf,md,tex` out of the box, the same as the desktop bookmarklet. To pin
+   this shortcut to specific formats regardless of the server default, add a
+   second Body field below — Type **Text**, Key `formats`, Value e.g.
+   `pdf,md`. Older setups posted to `/save-url`, which only ever wrote
+   Markdown; switching the URL to `/save` is all that's needed to match.)
 8. Tap **Show More** (below the URL field) to expand the options.
 9. Set **Method** to **POST**.
 10. Set **Request Body** to **JSON**.
@@ -194,9 +200,9 @@ curl http://SERVER_ADDRESS:8000/health
 
 **Debugging with `/echo`**
 The server has a debug endpoint that returns whatever it received. Temporarily
-change the shortcut URL from `/save-url` to `/echo`, run the shortcut, and inspect
+change the shortcut URL from `/save` to `/echo`, run the shortcut, and inspect
 the notification — it will show the exact request the server got. Swap back to
-`/save-url` once confirmed.
+`/save` once confirmed.
 
 ---
 
@@ -368,8 +374,8 @@ After the three credential actions:
 
 | Endpoint | Method | Body | Returns |
 |---|---|---|---|
-| `POST /save` | POST | JSON `{"url":"…","formats":["pdf","md"]}` | `{"status":"ok","files":[…],"title":"..."}` |
-| `POST /save-url` | POST | JSON `{"url":"https://..."}` | `{"status":"ok","filename":"...","title":"..."}` |
+| `POST /save` | POST | JSON `{"url":"…"}` (formats optional, default `pdf,md,tex`) | `{"status":"ok","files":[…],"summary":"..."}` |
+| `POST /save-url` | POST | JSON `{"url":"https://..."}` (Markdown only, legacy) | `{"status":"ok","files":[…],"summary":"..."}` |
 | `POST /save-pdf` | POST | multipart form, field `file` | `{"status":"ok","filename":"...","title":"..."}` |
 | `GET /save-page` | GET | query `?url=…&formats=pdf,md` | HTML result page (desktop bookmarklet) |
 | `POST /echo` | POST | anything | mirrors back headers + body |

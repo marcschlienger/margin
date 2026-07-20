@@ -84,6 +84,22 @@ MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB cap on PDF uploads
 # `?token=` query parameter, or the cookie set after one authenticated visit.
 MARGIN_TOKEN = os.getenv("MARGIN_TOKEN", "").strip()
 
+# Output formats. MD_FORMATS are the text formats the Markdown pipeline emits
+# (tex/org derived from md via Pandoc). DEFAULT_FORMATS is what a save writes
+# when the request doesn't specify — set via the DEFAULT_FORMATS env var
+# (comma-separated subset of pdf/md/tex/org). Every capture path (/save,
+# /save-page bookmarklet, /save-url iOS shortcut, the queue's pre-checked
+# boxes) honors it, so a save produces the same files however it was made.
+MD_FORMATS = ("md", "tex", "org")
+_ALL_FORMATS = ("pdf",) + MD_FORMATS
+DEFAULT_FORMATS = tuple(
+    f for f in re.split(r"[\s,]+", os.getenv("DEFAULT_FORMATS", "pdf,md,tex").lower())
+    if f in _ALL_FORMATS
+) or ("pdf",)
+# Text-only slice of the default, for the Markdown-only endpoints (/save-url,
+# /save-pdf) which can't emit a PDF.
+_DEFAULT_MD_FORMATS = tuple(f for f in DEFAULT_FORMATS if f in MD_FORMATS) or ("md",)
+
 
 def _default_output_dir() -> Path:
     if sys.platform == "darwin":  # original iCloud-inbox workflow
@@ -397,13 +413,8 @@ def _write_tex(md_path: Path, tex_path: Path, title: str) -> None:
     tex_path.write_text(tex, encoding="utf-8")
 
 
-# Text formats the Markdown pipeline can emit. "tex" and "org" are derived
-# from the Markdown via Pandoc and are selectable independently of "md".
-MD_FORMATS = ("md", "tex", "org")
-
-
 def _write_all_formats(filename: str, md_content: str, title: str,
-                       formats: tuple[str, ...] = MD_FORMATS) -> list[Path]:
+                       formats: tuple[str, ...] = _DEFAULT_MD_FORMATS) -> list[Path]:
     """Write the requested subset of .md/.tex/.org (collision-safe stem).
 
     Returns the files actually written — Pandoc-derived ones are skipped
@@ -878,7 +889,7 @@ class URLPayload(BaseModel):
 
 class SavePayload(BaseModel):
     url: str
-    formats: list[str] = ["pdf"]
+    formats: list[str] = list(DEFAULT_FORMATS)
     force: bool = False  # save again even if this URL was saved before
 
     @field_validator("url")
@@ -886,11 +897,15 @@ class SavePayload(BaseModel):
     def strip_url(cls, v: str) -> str:
         return _validated_url(v)
 
-    @field_validator("formats")
+    @field_validator("formats", mode="before")
     @classmethod
-    def check_formats(cls, v: list[str]) -> list[str]:
-        v = [f.lower().lstrip(".") for f in v] or ["pdf"]
-        unknown = set(v) - {"pdf", *MD_FORMATS}
+    def check_formats(cls, v) -> list[str]:
+        # Accept a comma/space-separated string too — iOS Shortcuts can send a
+        # plain text body far more easily than a JSON array.
+        if isinstance(v, str):
+            v = re.split(r"[\s,]+", v)
+        v = [f.lower().lstrip(".") for f in v if f] or list(DEFAULT_FORMATS)
+        unknown = set(v) - set(_ALL_FORMATS)
         if unknown:
             raise ValueError(
                 f"Unknown formats {sorted(unknown)}; "
@@ -1099,7 +1114,7 @@ async def _direct_pdf_title(client: httpx.AsyncClient, url: str,
 
 
 async def _run_markdown_save(
-    url: str, request: Request, formats: tuple[str, ...] = MD_FORMATS
+    url: str, request: Request, formats: tuple[str, ...] = _DEFAULT_MD_FORMATS
 ) -> dict:
     """Markdown pipeline: fetch, extract content + math, write the requested
     subset of .md/.tex/.org."""
@@ -1403,7 +1418,8 @@ async def save_page(request: Request, url: str = "",
     """
     fmt_list = [f for part in formats for f in re.split(r"[\s,]+", part) if f]
     try:
-        payload = SavePayload(url=url, formats=fmt_list or ["pdf"], force=force)
+        payload = SavePayload(url=url, formats=fmt_list or list(DEFAULT_FORMATS),
+                              force=force)
     except ValueError as e:
         return _save_page_response(False, "Invalid request", str(e))
 
@@ -1479,16 +1495,7 @@ __HEAD_ICONS__
   </div>
   <details class="formats">
     <summary>Formats: <b id="fmt-summary"></b></summary>
-    <div class="fmt-list">
-      <label><input type="checkbox" name="formats" value="pdf" checked>
-        PDF <small>— the page exactly as rendered</small></label>
-      <label><input type="checkbox" name="formats" value="md" checked>
-        Markdown <small>— article text, math as LaTeX (.md)</small></label>
-      <label><input type="checkbox" name="formats" value="tex">
-        LaTeX <small>— compilable article (.tex)</small></label>
-      <label><input type="checkbox" name="formats" value="org">
-        Org <small>— Emacs Org-mode (.org)</small></label>
-    </div>
+    <div class="fmt-list">__FORMAT_CHECKBOXES__</div>
   </details>
 </form>
 <div class="tabs">
@@ -1518,7 +1525,7 @@ document.getElementById('filter').addEventListener('input', function () {
   function update() {
     const picked = boxes.filter(b => b.checked).map(b => b.value);
     document.getElementById('fmt-summary').textContent =
-      picked.length ? picked.map(v => NAMES[v]).join(', ') : 'PDF (default)';
+      picked.length ? picked.map(v => NAMES[v]).join(', ') : 'none';
     localStorage.setItem('margin-formats', picked.join(','));
   }
   boxes.forEach(b => b.addEventListener('change', update));
@@ -1530,6 +1537,36 @@ document.getElementById('filter').addEventListener('input', function () {
 
 def _archive_dir() -> Path:
     return OUTPUT_DIR / _ARCHIVE_SUBDIR
+
+
+# Quick-save format checkboxes; pre-checked to match DEFAULT_FORMATS.
+_FORMAT_LABELS = [
+    ("pdf", "PDF", "the page exactly as rendered"),
+    ("md", "Markdown", "article text, math as LaTeX (.md)"),
+    ("tex", "LaTeX", "compilable article (.tex)"),
+    ("org", "Org", "Emacs Org-mode (.org)"),
+]
+
+
+def _format_checkboxes() -> str:
+    rows = []
+    for val, name, desc in _FORMAT_LABELS:
+        checked = " checked" if val in DEFAULT_FORMATS else ""
+        rows.append(
+            f'<label><input type="checkbox" name="formats" value="{val}"{checked}> '
+            f'{name} <small>— {desc}</small></label>'
+        )
+    return "\n      ".join(rows)
+
+
+def _url_by_stem() -> dict[str, str]:
+    """Reverse of the saved-URL index: stem → source URL. Lets the queue show
+    a source link for PDF-only items, which have no Markdown frontmatter."""
+    out: dict[str, str] = {}
+    for url, stems in _load_url_index().items():
+        for s in stems:
+            out.setdefault(s, url)
+    return out
 
 
 def _pretty_stem(stem: str) -> str:
@@ -1556,6 +1593,7 @@ def _list_items(folder: Path) -> list[dict]:
             if f.is_file() and f.suffix.lower() in _SERVE_EXTS:
                 groups.setdefault(f.stem, []).append(f)
 
+    url_by_stem = _url_by_stem()
     items = []
     for stem, files in groups.items():
         files.sort(key=lambda f: _SERVE_EXTS.index(f.suffix.lower()))
@@ -1564,7 +1602,10 @@ def _list_items(folder: Path) -> list[dict]:
         m = re.match(r"^(\d{4}-\d{2}-\d{2})", stem)
         date_str = (m.group(1) if m
                     else date.fromtimestamp(files[0].stat().st_mtime).isoformat())
-        source = _read_frontmatter_field(md, "source_url") if md else None
+        # Prefer the exact URL from Markdown frontmatter; fall back to the
+        # saved-URL index so PDF-only items get a source link too.
+        source = ((_read_frontmatter_field(md, "source_url") if md else None)
+                  or url_by_stem.get(stem))
         items.append({"stem": stem, "title": title, "date": date_str,
                       "source": source, "files": files})
     items.sort(key=lambda i: (i["date"], i["stem"]), reverse=True)
@@ -1619,6 +1660,7 @@ async def index(view: str = "inbox"):
     archive_n = len(items) if view == "archive" else len(_list_items(_archive_dir()))
     html = (_INDEX_HTML
             .replace("__HEAD_ICONS__", _HEAD_ICONS)
+            .replace("__FORMAT_CHECKBOXES__", _format_checkboxes())
             .replace("__INBOX_COUNT__", str(inbox_n))
             .replace("__ARCHIVE_COUNT__", str(archive_n))
             .replace("__ROWS__", rows))

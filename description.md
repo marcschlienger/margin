@@ -94,8 +94,10 @@ only `/save-pdf` returns an error.
 ### `POST /save`
 
 **Input:** JSON body `{ "url": "https://...", "formats": [...] }` —
-`formats` optional (default `["pdf"]`), any subset of `pdf`, `md`, `tex`,
-`org`, each selected independently.
+`formats` optional, any subset of `pdf`, `md`, `tex`, `org`, each selected
+independently; may also be a comma-separated string. Omitted, it uses the
+`DEFAULT_FORMATS` env setting (ships as `pdf,md,tex`), which every capture
+path shares so a save yields the same files however it was triggered.
 
 **Process:**
 1. If the URL serves a PDF directly (content type or `.pdf` extension), the

@@ -126,6 +126,36 @@ def test_formats_validation():
         app.SavePayload(url="https://a.test/x", formats=["docx"])
 
 
+def test_default_formats_shared_everywhere():
+    # Ships as PDF + Markdown + TeX; Org opt-in. Text-only slice drops pdf.
+    assert app.DEFAULT_FORMATS == ("pdf", "md", "tex")
+    assert app._DEFAULT_MD_FORMATS == ("md", "tex")
+    # An unspecified save uses the default; an empty list falls back to it too.
+    assert app.SavePayload(url="https://a.test/x").formats == ["pdf", "md", "tex"]
+    assert app.SavePayload(url="https://a.test/x", formats=[]).formats == \
+        ["pdf", "md", "tex"]
+    # Comma/space string accepted (iOS Shortcuts sends a text body, not JSON)
+    assert app.SavePayload(url="https://a.test/x", formats="pdf, md").formats == \
+        ["pdf", "md"]
+
+
+def test_queue_checkboxes_reflect_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    html = TestClient(app.app).get("/").text
+    assert 'value="pdf" checked' in html
+    assert 'value="md" checked' in html
+    assert 'value="tex" checked' in html
+    assert 'value="org" checked' not in html   # Org opt-in
+
+
+def test_source_link_from_index_for_pdf_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-p.pdf").write_bytes(b"%PDF")  # no .md, no frontmatter
+    app._record_url("https://a.test/paper", "2026-07-19-p")
+    (item,) = app._list_items(tmp_path)
+    assert item["source"] == app._norm_url("https://a.test/paper")
+
+
 def test_write_all_formats_md_only(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
     written = app._write_all_formats("2026-07-19-t.md", "# T\n\nbody", "T", ("md",))
