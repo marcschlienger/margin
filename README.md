@@ -26,15 +26,14 @@ collect the results in a synced folder (iCloud → Obsidian, Nextcloud, Syncthin
         ▼
  ┌─────────────────────── Margin (FastAPI, port 8000) ───────────────────────┐
  │                                                                           │
- │  POST /save ──► headless Chromium (Playwright)                            │
- │                   goto → network idle → MathJax/KaTeX done → fonts ready  │
- │                   └─► page.pdf()  ──────────────────────────►  .pdf       │
+ │  POST /save  web page ─► headless Chromium ─► page.pdf() ──►  .pdf        │
+ │              (waits: network idle → MathJax/KaTeX done → fonts ready)     │
+ │              + HTML math extraction ─► trafilatura ──────►  .md/.tex/.org │
  │                                                                           │
- │  POST /save-url ─► fetch HTML ─► math extraction ─► trafilatura ─► .md    │
- │                    (falls back to the Chromium DOM     + .tex/.org        │
- │                     for SPAs and bot-walled fetches)   via Pandoc         │
+ │  POST /save  PDF URL  ─► store as-is ──►  .pdf                            │
+ │              + Mathpix OCR ─────────────►  .md/.tex/.org                  │
  │                                                                           │
- │  POST /save-pdf ─► Mathpix OCR API ─► Mathpix Markdown ─►  .md            │
+ │  POST /save-pdf  upload ─► keep file .pdf  +  Mathpix OCR .md/.tex/.org   │
  │                                                                           │
  └────────────────────────────► OUTPUT_DIR ◄────────────────────────────────┘
                     (e.g. an iCloud/Nextcloud folder synced to your notes app)
@@ -85,10 +84,15 @@ than a JSON array.
   embedded metadata. Bot-challenge interstitials ("Just a moment…") and
   soft-404 pages are detected by title/status and reported as errors, never
   saved.
-- **`md`** / **`tex`** / **`org`** — run the Markdown pipeline below and write
-  the selected text formats: `.md` (Markdown, math as LaTeX), `.tex`
-  (compilable LaTeX article), `.org` (Emacs Org-mode). `tex`/`org` are
-  Pandoc-derived and work without `md` selected.
+- **`md`** / **`tex`** / **`org`** — the text formats: `.md` (Markdown, math
+  as LaTeX), `.tex` (compilable LaTeX article), `.org` (Emacs Org-mode);
+  `tex`/`org` are Pandoc-derived and work without `md` selected. For a web
+  page these come from the HTML pipeline below. **For a URL that serves a PDF
+  directly, they come from Mathpix OCR of that PDF** — so an arXiv (or
+  archive.org) PDF is saved as the PDF *and* converted to Markdown/LaTeX in
+  one request. OCR needs `MATHPIX_APP_ID`/`KEY`; without them the PDF is
+  still saved and the text formats are skipped with a warning in the
+  response's `warnings` array.
 
 Re-saving a URL that is already in the inbox or archive is skipped: the
 response carries `"duplicate": true` plus the existing files, instead of
@@ -130,10 +134,13 @@ duplicated URL); only `http(s)` URLs are accepted.
 
 ### `POST /save-pdf` — PDF upload → Markdown
 
-Multipart form upload, field `file`, ≤ 50 MB. Converts via the
-[Mathpix](https://mathpix.com) `/v3/pdf` OCR API (polls up to 3 minutes) —
-best-in-class for math PDFs, requires `MATHPIX_APP_ID`/`MATHPIX_APP_KEY`.
-Without credentials the rest of the server works; only this endpoint errors.
+Multipart form upload, field `file`, ≤ 50 MB (the iOS "Save PDF" shortcut).
+**Keeps the uploaded PDF** (when `pdf` is in `DEFAULT_FORMATS`) *and* OCRs it
+to the default text formats via the [Mathpix](https://mathpix.com) `/v3/pdf`
+API (polls up to 3 minutes) — best-in-class for math PDFs. Needs
+`MATHPIX_APP_ID`/`MATHPIX_APP_KEY`; without them the PDF is still saved and
+the OCR step is skipped with a warning. So an uploaded PDF yields the same
+PDF + Markdown + LaTeX as a URL save.
 
 ### `GET /` — built-in reading queue
 

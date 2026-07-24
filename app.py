@@ -925,16 +925,6 @@ async def echo(request: Request):
     return {"method": request.method, "headers": dict(request.headers), "body": body}
 
 
-def _ok(md_path: Path, title: str) -> dict:
-    return {
-        "status": "ok",
-        "filename": md_path.name,
-        "title": title,
-        "path": str(md_path),
-        "summary": f"Saved: {md_path.name}",
-    }
-
-
 def _log(label: str, msg: str) -> None:
     print(f"[{label}] {msg}", file=sys.stderr, flush=True)
 
@@ -1204,11 +1194,21 @@ async def save_url(payload: URLPayload, request: Request):
     return await _run_markdown_save(payload.url, request)
 
 
+def _mathpix_missing_warning(md_formats: tuple[str, ...]) -> str:
+    exts = "/".join("." + f for f in md_formats)
+    return (f"PDF → {exts} needs Mathpix credentials "
+            "(MATHPIX_APP_ID / MATHPIX_APP_KEY); text formats skipped")
+
+
 @app.post("/save")
 async def save(payload: SavePayload, request: Request):
-    """Save any web page. Format "pdf" renders it in headless Chromium (waits
-    for JS/MathJax/KaTeX to finish) and exports a PDF; "md" runs the
-    Markdown-extraction pipeline. Default is ["pdf"]."""
+    """Save any page into the requested formats (default: DEFAULT_FORMATS).
+
+    A web page → PDF via headless Chromium + Markdown via the HTML pipeline.
+    A URL that serves a PDF directly → the PDF stored as-is + Markdown/LaTeX
+    via Mathpix OCR (skipped with a warning when Mathpix isn't configured).
+    Either way the same formats are produced, so a save is consistent
+    regardless of the source."""
     _log("save", f"{payload.formats} {payload.url}")
     client: httpx.AsyncClient = request.app.state.client
     renderer: Renderer = request.app.state.renderer
@@ -1222,21 +1222,47 @@ async def save(payload: SavePayload, request: Request):
     saved: list[str] = []
     errors: list[str] = []
     title = ""
+    want_pdf = "pdf" in payload.formats
+    md_formats = tuple(f for f in payload.formats if f in MD_FORMATS)
 
-    if "pdf" in payload.formats:
-        try:
-            direct = await _fetch_pdf_bytes(client, payload.url)
-        except Exception as e:
-            _log("save", f"direct-pdf probe failed: {e}")
-            direct = None
-        if direct is not None:
-            # The URL already serves a PDF — store it as-is.
-            title = _clean_title(await _direct_pdf_title(client, payload.url, direct))
-            pdf_path = _write_binary(_filename(title, "pdf"), direct)
+    # Probe once: does the URL serve a PDF directly? (One HEAD for web pages.)
+    try:
+        pdf_bytes = await _fetch_pdf_bytes(client, payload.url)
+    except Exception as e:
+        _log("save", f"direct-pdf probe failed: {e}")
+        pdf_bytes = None
+
+    if pdf_bytes is not None:
+        # ---- Source is a PDF: store it as-is, OCR it for the text formats ----
+        title = _clean_title(await _direct_pdf_title(client, payload.url, pdf_bytes))
+        stem = None
+        if want_pdf:
+            pdf_path = _write_binary(_filename(title, "pdf"), pdf_bytes)
             saved.append(pdf_path.name)
-            _record_url(payload.url, pdf_path.stem)
+            stem = pdf_path.stem
+            _record_url(payload.url, stem)
             _log("save", f"saved direct PDF → {pdf_path.name}")
-        else:
+        if md_formats and not (MATHPIX_APP_ID and MATHPIX_APP_KEY):
+            errors.append(_mathpix_missing_warning(md_formats))
+        elif md_formats:
+            try:
+                mmd = await _mathpix_pdf(pdf_bytes)
+                md = _frontmatter(title, payload.url, has_math="$" in mmd) + "\n" + mmd
+                written = _write_all_formats(
+                    f"{stem}.md" if stem else _filename(title), md, title, md_formats
+                )
+                saved.extend(p.name for p in written)
+                if written and stem is None:
+                    _record_url(payload.url, written[0].stem)
+                _log("save", f"OCR'd PDF → {', '.join(p.name for p in written)}")
+            except HTTPException as e:
+                errors.append(f"Mathpix: {e.detail}")
+            except Exception as e:
+                _log("save", f"PDF OCR failed: {e}\n{traceback.format_exc()}")
+                errors.append(f"PDF OCR failed: {e}")
+    else:
+        # ---- Source is a web page: render for PDF, extract HTML for text ----
+        if want_pdf:
             try:
                 rendered = await renderer.render(payload.url)
                 if looks_blocked(rendered.title):
@@ -1259,16 +1285,15 @@ async def save(payload: SavePayload, request: Request):
                 _log("save", f"render failed: {e}\n{traceback.format_exc()}")
                 errors.append(f"Could not render {payload.url}: {e}")
 
-    md_formats = tuple(f for f in payload.formats if f in MD_FORMATS)
-    if md_formats:
-        # Skip the endpoint's duplicate check — this request already passed it
-        # (and the PDF just written above would otherwise count as a duplicate).
-        md_result = await _run_markdown_save(payload.url, request, md_formats)
-        if md_result.get("status") == "ok":
-            saved.extend(md_result["files"])
-            title = title or md_result["title"]
-        else:
-            errors.append(md_result.get("message", "markdown save failed"))
+        if md_formats:
+            # Skip the endpoint's duplicate check — this request already passed
+            # it (and the PDF above would otherwise count as a duplicate).
+            md_result = await _run_markdown_save(payload.url, request, md_formats)
+            if md_result.get("status") == "ok":
+                saved.extend(md_result["files"])
+                title = title or md_result["title"]
+            else:
+                errors.append(md_result.get("message", "markdown save failed"))
 
     if not saved:
         return _err("; ".join(errors) or "nothing saved")
@@ -1284,37 +1309,72 @@ async def save(payload: SavePayload, request: Request):
 
 @app.post("/save-pdf")
 async def save_pdf(file: UploadFile = File(...)):
-    """Convert PDF via Mathpix, save the resulting Markdown to the output dir."""
+    """Save an uploaded PDF: keep the file (if 'pdf' is a default format) and,
+    with Mathpix configured, OCR it to the default text formats. Without
+    Mathpix the PDF is still kept and the text step is skipped with a warning."""
     _log("save-pdf", f"received {file.filename}")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         return _err("Expected a .pdf file")
-    if not MATHPIX_APP_ID or not MATHPIX_APP_KEY:
-        return _err("MATHPIX_APP_ID / MATHPIX_APP_KEY not set in .env")
 
     pdf_bytes = await file.read()
     if len(pdf_bytes) > MAX_PDF_BYTES:
         return _err(f"PDF too large: {len(pdf_bytes)} bytes (max {MAX_PDF_BYTES})")
 
-    try:
-        mmd = await _mathpix_pdf(pdf_bytes)
-    except HTTPException as e:
-        _log("save-pdf", f"mathpix error: {e.detail}")
-        return _err(str(e.detail))
-    except Exception as e:
-        _log("save-pdf", f"mathpix crash: {e}\n{traceback.format_exc()}")
-        return _err(f"Mathpix call failed: {e}")
+    saved: list[str] = []
+    errors: list[str] = []
+    title = _clean_title(Path(file.filename).stem)
 
-    m = re.search(r"^#\s+(.+)$", mmd, re.MULTILINE)
-    title = _clean_title(m.group(1).strip() if m else Path(file.filename).stem)
+    # OCR first (it yields a better title from the document's first heading),
+    # then write files under that title so the PDF and text share a stem.
+    mmd = None
+    if _DEFAULT_MD_FORMATS and not (MATHPIX_APP_ID and MATHPIX_APP_KEY):
+        errors.append(_mathpix_missing_warning(_DEFAULT_MD_FORMATS))
+    elif _DEFAULT_MD_FORMATS:
+        try:
+            mmd = await _mathpix_pdf(pdf_bytes)
+            m = re.search(r"^#\s+(.+)$", mmd, re.MULTILINE)
+            if m:
+                title = _clean_title(m.group(1).strip())
+        except HTTPException as e:
+            errors.append(f"Mathpix: {e.detail}")
+        except Exception as e:
+            _log("save-pdf", f"mathpix crash: {e}\n{traceback.format_exc()}")
+            errors.append(f"Mathpix call failed: {e}")
 
-    md = _frontmatter(title, has_math="$" in mmd) + "\n" + mmd
-    try:
-        written = _write_all_formats(_filename(title), md, title)
-    except Exception as e:
-        _log("save-pdf", f"write failed: {e}\n{traceback.format_exc()}")
-        return _err(f"Could not write file: {e}")
-    _log("save-pdf", f"saved → {written[0].name}")
-    return _ok(written[0], title)
+    stem = None
+    if "pdf" in DEFAULT_FORMATS:
+        try:
+            pdf_path = _write_binary(_filename(title, "pdf"), pdf_bytes)
+            saved.append(pdf_path.name)
+            stem = pdf_path.stem
+        except Exception as e:
+            _log("save-pdf", f"write failed: {e}\n{traceback.format_exc()}")
+            errors.append(f"Could not write PDF: {e}")
+
+    if mmd is not None:
+        md = _frontmatter(title, has_math="$" in mmd) + "\n" + mmd
+        try:
+            written = _write_all_formats(
+                f"{stem}.md" if stem else _filename(title), md, title,
+                _DEFAULT_MD_FORMATS,
+            )
+            saved.extend(p.name for p in written)
+        except Exception as e:
+            _log("save-pdf", f"write failed: {e}\n{traceback.format_exc()}")
+            errors.append(f"Could not write text formats: {e}")
+
+    if not saved:
+        return _err("; ".join(errors) or "nothing saved")
+    _log("save-pdf", f"saved → {', '.join(saved)}")
+    return {
+        "status": "ok",
+        "filename": saved[0],
+        "files": saved,
+        "title": title,
+        "path": str(OUTPUT_DIR),
+        "summary": f"Saved: {', '.join(saved)}",
+        **({"warnings": errors} if errors else {}),
+    }
 
 
 # ---------------------------------------------------------------------------

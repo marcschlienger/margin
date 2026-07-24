@@ -99,19 +99,27 @@ independently; may also be a comma-separated string. Omitted, it uses the
 `DEFAULT_FORMATS` env setting (ships as `pdf,md,tex`), which every capture
 path shares so a save yields the same files however it was triggered.
 
-**Process:**
-1. If the URL serves a PDF directly (content type or `.pdf` extension), the
-   file is downloaded and stored as-is.
-2. Otherwise the page is loaded in headless Chromium: waits for
-   DOM-content-loaded, then network idle (best effort), then MathJax 2/3
-   typesetting via their JS promises/queues and `document.fonts.ready`.
-3. Bot-challenge interstitials ("Just a moment…" etc.) are detected by title
-   and reported as errors instead of being saved.
-4. The rendered page is exported as `YYYY-MM-DD-title-slug.pdf` (screen CSS,
-   A4, backgrounds on) into the output directory.
-5. With any of `"md"`, `"tex"`, `"org"` in `formats`, the Markdown pipeline
-   below also runs and writes exactly the selected text formats (`tex`/`org`
-   are derived via Pandoc and don't require `md`).
+**Process:** the server probes once whether the URL serves a PDF directly
+(content type or `.pdf` extension), then branches:
+
+*If it's a PDF:*
+1. `pdf` format → the file is downloaded and stored as-is (title from the
+   arXiv abstract page or embedded PDF metadata).
+2. `md`/`tex`/`org` → the PDF bytes are OCR'd via Mathpix into
+   Markdown/LaTeX, written under the same filename stem so they group with
+   the PDF. Without `MATHPIX_APP_ID`/`KEY` this step is skipped and a warning
+   is added; the PDF is still saved.
+
+*If it's a web page:*
+3. `pdf` → loaded in headless Chromium (waits for DOM-content-loaded, network
+   idle best-effort, MathJax 2/3 typesetting via JS promises/queues, and
+   `document.fonts.ready`), exported as `YYYY-MM-DD-title-slug.pdf` (screen
+   CSS, A4, backgrounds on). Bot-challenge interstitials and soft-404s are
+   detected by title/status and reported as errors instead of saved.
+4. `md`/`tex`/`org` → the HTML Markdown pipeline below.
+
+Either branch yields the same requested formats, so a save is consistent
+regardless of whether the URL was a page or a PDF.
 
 **Returns:** `{ "status": "ok", "title": "...", "files": [...], "path": "..." }`,
 or `{ "status": "error", "message": "..." }` — always HTTP 200.
@@ -145,14 +153,16 @@ a notification. (HTTP 4xx/5xx would otherwise abort the Shortcut silently.)
 **Input:** multipart form upload, field name `file`, containing a PDF.
 
 **Process:**
-1. Validates Mathpix credentials are configured and the upload is `<= 50 MB`.
-2. Uploads the PDF to `https://api.mathpix.com/v3/pdf`.
-3. Polls `GET /v3/pdf/{pdf_id}` every 3 seconds until status is `completed`
-   (timeout: 3 minutes / 60 polls).
-4. Downloads the result as Mathpix Markdown (MMD) from `/v3/pdf/{pdf_id}.mmd`.
-5. Extracts the document title from the first `#` heading, or falls back to the
-   PDF filename stem (with site-suffix stripping applied).
-6. Writes the `.md` file to the output directory plus companion `.tex` and `.org`.
+1. Validates the upload is a PDF `<= 50 MB`.
+2. If Mathpix is configured, OCRs the PDF (upload → poll `/v3/pdf/{pdf_id}`
+   every 3 s to `completed`, ≤ 3 min → fetch MMD), taking the title from the
+   first `#` heading. Without credentials this step is skipped with a warning.
+3. Keeps the uploaded PDF file (when `pdf` is in `DEFAULT_FORMATS`) and writes
+   the OCR'd text in the default text formats, all under one filename stem.
+
+So an uploaded PDF produces the same PDF + Markdown + LaTeX as a URL that
+points at a PDF — the iOS "Save PDF" shortcut and the desktop bookmarklet on
+a PDF link converge on the same result.
 
 **Mathpix options used:**
 - Output format: MMD (Mathpix Markdown — a superset of standard Markdown)

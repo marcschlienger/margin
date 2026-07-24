@@ -376,7 +376,7 @@ After the three credential actions:
 |---|---|---|---|
 | `POST /save` | POST | JSON `{"url":"…"}` (formats optional, default `pdf,md,tex`) | `{"status":"ok","files":[…],"summary":"..."}` |
 | `POST /save-url` | POST | JSON `{"url":"https://..."}` (Markdown only, legacy) | `{"status":"ok","files":[…],"summary":"..."}` |
-| `POST /save-pdf` | POST | multipart form, field `file` | `{"status":"ok","filename":"...","title":"..."}` |
+| `POST /save-pdf` | POST | multipart form, field `file` (keeps PDF + OCRs to md/tex) | `{"status":"ok","files":[…],"summary":"..."}` |
 | `GET /save-page` | GET | query `?url=…&formats=pdf,md` | HTML result page (desktop bookmarklet) |
 | `POST /echo` | POST | anything | mirrors back headers + body |
 | `GET /health` | GET | — | server status + config check |

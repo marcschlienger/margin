@@ -173,6 +173,80 @@ def test_write_all_formats_tex_without_md(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# PDF → PDF + Markdown/LaTeX (OCR), consistency across sources
+# ---------------------------------------------------------------------------
+
+def _patch_direct_pdf(monkeypatch, tmp_path, mathpix=True):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+
+    async def fake_fetch(client, url):
+        return b"%PDF-1.4 fake bytes"
+
+    async def fake_title(client, url, data):
+        return "Fourier Notes"
+
+    async def fake_mathpix(data):
+        return "# Fourier Notes\n\nInline $a_i + b_j$ math.\n"
+
+    monkeypatch.setattr(app, "_fetch_pdf_bytes", fake_fetch)
+    monkeypatch.setattr(app, "_direct_pdf_title", fake_title)
+    monkeypatch.setattr(app, "_mathpix_pdf", fake_mathpix)
+    monkeypatch.setattr(app, "MATHPIX_APP_ID", "id" if mathpix else "")
+    monkeypatch.setattr(app, "MATHPIX_APP_KEY", "key" if mathpix else "")
+
+
+def test_save_direct_pdf_with_ocr(tmp_path, monkeypatch):
+    _patch_direct_pdf(monkeypatch, tmp_path, mathpix=True)
+    with TestClient(app.app) as client:
+        r = client.post("/save", json={"url": "https://a.test/doc.pdf",
+                                       "formats": ["pdf", "md"]})
+    d = r.json()
+    assert d["status"] == "ok"
+    exts = {f.rsplit(".", 1)[1] for f in d["files"]}
+    assert "pdf" in exts and "md" in exts          # PDF kept + OCR'd to Markdown
+    md = next(p for p in tmp_path.iterdir() if p.suffix == ".md")
+    assert "$a_i + b_j$" in md.read_text()
+    # PDF and Markdown share a stem so they group in the queue
+    stems = {p.stem for p in tmp_path.iterdir() if p.suffix in (".pdf", ".md")}
+    assert len(stems) == 1
+
+
+def test_save_direct_pdf_without_mathpix_warns(tmp_path, monkeypatch):
+    _patch_direct_pdf(monkeypatch, tmp_path, mathpix=False)
+    with TestClient(app.app) as client:
+        r = client.post("/save", json={"url": "https://a.test/doc.pdf",
+                                       "formats": ["pdf", "md"]})
+    d = r.json()
+    assert d["status"] == "ok"
+    assert any(f.endswith(".pdf") for f in d["files"])      # PDF still saved
+    assert not any(f.endswith(".md") for f in d["files"])   # OCR skipped
+    assert any("Mathpix" in w for w in d.get("warnings", []))
+
+
+def test_save_pdf_upload_keeps_file_and_ocrs(tmp_path, monkeypatch):
+    _patch_direct_pdf(monkeypatch, tmp_path, mathpix=True)
+    with TestClient(app.app) as client:
+        r = client.post("/save-pdf",
+                        files={"file": ("doc.pdf", b"%PDF fake", "application/pdf")})
+    d = r.json()
+    assert d["status"] == "ok"
+    assert any(f.endswith(".pdf") for f in d["files"])   # uploaded PDF kept
+    assert any(f.endswith(".md") for f in d["files"])    # + OCR text
+
+
+def test_save_pdf_upload_without_mathpix_keeps_pdf(tmp_path, monkeypatch):
+    _patch_direct_pdf(monkeypatch, tmp_path, mathpix=False)
+    with TestClient(app.app) as client:
+        r = client.post("/save-pdf",
+                        files={"file": ("doc.pdf", b"%PDF fake", "application/pdf")})
+    d = r.json()
+    assert d["status"] == "ok"
+    assert any(f.endswith(".pdf") for f in d["files"])
+    assert not any(f.endswith(".md") for f in d["files"])
+    assert any("Mathpix" in w for w in d.get("warnings", []))
+
+
+# ---------------------------------------------------------------------------
 # URL validation and cleaning
 # ---------------------------------------------------------------------------
 
@@ -254,7 +328,6 @@ from fastapi.testclient import TestClient
 
 def test_responses_carry_notification_summary(tmp_path, monkeypatch):
     assert app._err("boom")["summary"] == "Error: boom"
-    assert app._ok(tmp_path / "a.md", "T")["summary"] == "Saved: a.md"
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
     (tmp_path / "2026-07-19-x.pdf").write_bytes(b"%PDF")
     app._record_url("https://a.test/x", "2026-07-19-x")
