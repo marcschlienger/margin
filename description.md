@@ -416,6 +416,36 @@ browser suite's runtime halved once this landed.
 Mathpix output is unaffected either way: the PDF path emits `$…$` directly,
 so the gate concerns only the HTML pipeline.
 
+## Code, which is made of the same characters as maths
+
+A general read-later queue is full of shell and C++, and both are written with
+`$`, `_`, `^`, `<` and `>`. Three things had to be checked rather than assumed,
+and all three hold:
+
+- **Extraction leaves code alone.** `trafilatura` emits fenced blocks and
+  inline spans, and nothing downstream touches them: `export PATH="$HOME/bin:$PATH"`,
+  `awk '{print $1, $3}'` and `"${f%.md}.markdown"` come through byte for byte.
+- **The reader leaves it alone too.** `_render_markdown` stashes math spans
+  *before* Markdown conversion, and `$HOME/bin:$PATH` matches the inline-math
+  pattern exactly — but it is restored as escaped text, so what lands in the
+  page is what was written.
+- **MathJax skips it.** Its default `skipHtmlTags` covers `<pre>` and
+  `<code>`. Verified in a browser on a page with one real formula and two
+  shell blocks: one `mjx-container`, none inside code, and the blocks intact.
+
+What did *not* hold was the detection. Both the front-matter `math` tag and
+the reader's decision to load MathJax looked for `$…$` anywhere in the body,
+so an article about shell scripting was tagged as maths and fetched a
+megabyte of JavaScript to typeset nothing. `_has_math_outside_code` removes
+fenced blocks and inline spans first, then looks. Inline spans matter as much
+as fences: in "Use `$HOME` and `$PATH` together" the text between the two
+dollars carries neither a dollar nor a newline, so the inline-math pattern
+matches straight across them.
+
+A page with both — a formula in prose and a shell block — still counts as
+maths, which is right: there is something to typeset, and MathJax will leave
+the block alone.
+
 ## Content Extraction
 
 After the math pre-processing pass, the modified HTML is passed to

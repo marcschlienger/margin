@@ -960,6 +960,25 @@ def _preserve_sub_sup(soup: BeautifulSoup) -> None:
 # A display block or an inline span — used to protect existing math regions
 # from the prose-wrapping pass below.
 _RE_MATH_SPAN = re.compile(r"\$\$.*?\$\$|(?<!\$)\$(?!\$)[^$\n]+\$", re.DOTALL)
+# Code fences and inline spans, so math can be looked for outside them.
+_RE_FENCED_CODE = re.compile(r"^(?P<fence>```+|~~~+).*?^(?P=fence)[ \t]*$",
+                             re.MULTILINE | re.DOTALL)
+_RE_INLINE_CODE = re.compile(r"`+[^`\n]*`+")
+
+
+def _has_math_outside_code(body: str) -> bool:
+    """Whether the text carries math anywhere it could be typeset.
+
+    A shell article is full of $HOME, $PATH and {print $1, $3}, which look
+    exactly like inline math and are not. MathJax skips <pre> and <code> —
+    verified in a browser: a page with one real formula and two shell blocks
+    typesets one thing and leaves the blocks byte-for-byte intact — so
+    counting them meant tagging a page about shell scripts as maths and
+    fetching a megabyte of JavaScript to typeset nothing.
+    """
+    outside = _RE_FENCED_CODE.sub("", body)
+    outside = _RE_INLINE_CODE.sub("", outside)
+    return bool(_RE_MATH_SPAN.search(outside))
 
 # Isolated = not adjacent to any letter (Unicode-aware: `[^\W\d_]` is "letter"),
 # so Greek prose like Πλάτων is left alone while a lone θ still gets wrapped.
@@ -1700,7 +1719,7 @@ async def _run_markdown_save(
         )
     title = title or url
 
-    md = _frontmatter(title, url, has_math="$" in body) + "\n" + body
+    md = _frontmatter(title, url, has_math=_has_math_outside_code(body)) + "\n" + body
     try:
         filename = f"{preferred_stem}.md" if preferred_stem else _filename(title)
         # Off the loop: Pandoc is subprocess.run(timeout=30) and Margin asks
@@ -1793,7 +1812,7 @@ async def save(payload: SavePayload, request: Request):
         elif md_formats:
             try:
                 mmd = await _mathpix_pdf(pdf_bytes)
-                md = _frontmatter(title, payload.url, has_math="$" in mmd) + "\n" + mmd
+                md = _frontmatter(title, payload.url, has_math=_has_math_outside_code(mmd)) + "\n" + mmd
                 written = await asyncio.to_thread(
                     _write_all_formats,
                     f"{stem}.md" if stem else _filename(title), md, title,
@@ -1908,7 +1927,7 @@ async def save_pdf(file: UploadFile = File(...)):
             errors.append(f"Could not write PDF: {e}")
 
     if mmd is not None:
-        md = _frontmatter(title, has_math="$" in mmd) + "\n" + mmd
+        md = _frontmatter(title, has_math=_has_math_outside_code(mmd)) + "\n" + mmd
         try:
             written = await asyncio.to_thread(
                 _write_all_formats,
@@ -2650,7 +2669,7 @@ async def read_file(name: str):
             # Only where there is something to typeset. A megabyte of
             # JavaScript from a CDN is a strange thing to fetch for an
             # article about tooling, and most of a read-later queue is that.
-            if _RE_MATH_SPAN.search(body):
+            if _has_math_outside_code(body):
                 mathjax = _MATHJAX_SNIPPET
         else:
             content = f"<pre>{_html_escape(body)}</pre>"

@@ -1534,3 +1534,84 @@ def test_the_reader_loads_mathjax_only_where_there_is_math(tmp_path, monkeypatch
     maths = client.get("/read/2026-07-19-maths.md").text
     assert "mathjax" not in prose.lower(), "MathJax fetched for a page with no math"
     assert "mathjax" in maths.lower()
+
+
+# ---------------------------------------------------------------------------
+# Code, which competes with maths for the same characters
+# ---------------------------------------------------------------------------
+
+_CODE_ARTICLE = """<html><head><title>Shell tricks</title></head><body><article>
+<p>A short intro paragraph that is long enough for the extractor to keep the
+article body rather than treating the whole thing as boilerplate chrome, and
+which mentions nothing mathematical at all.</p>
+<pre><code>export PATH="$HOME/bin:$PATH"
+awk '{print $1, $3}' access.log | sort | uniq -c
+for f in *.md; do mv "$f" "${f%.md}.markdown"; done
+</code></pre>
+<p>Inline you would write <code>$PATH</code> or <code>a_b_c</code> and expect
+them to survive, and this paragraph is padded so the extractor keeps it too.</p>
+</article></body></html>"""
+
+
+def test_code_survives_extraction_unchanged():
+    """A general read-later queue is full of shell and C++, and both are made
+    of the characters maths is made of."""
+    _, body = app._extract_url_content(_CODE_ARTICLE, "https://example.test/x")
+    for snippet in ('export PATH="$HOME/bin:$PATH"', "awk '{print $1, $3}'",
+                    '"${f%.md}.markdown"', "`$PATH`", "`a_b_c`"):
+        assert snippet in body, snippet
+    assert "\\alpha" not in body and "$\\" not in body
+
+
+def test_code_survives_the_reader_unchanged():
+    """The reader stashes math spans before Markdown conversion, and
+    "$HOME/bin:$PATH" matches the inline-math pattern exactly."""
+    md = ('# Shell\n\n```\nexport PATH="$HOME/bin:$PATH"\n'
+          "awk '{print $1, $3}' access.log\n```\n\n"
+          "Inline `$PATH` and `a_b_c` in prose.\n\n"
+          "And real maths: $E = mc^2$.\n")
+    out = app._render_markdown(md)
+    assert "$HOME/bin:$PATH" in out
+    assert "{print $1, $3}" in out
+    assert "<code>$PATH</code>" in out
+    assert "$E = mc^2$" in out            # left for MathJax, which skips code
+
+
+def test_shell_variables_are_not_mistaken_for_maths():
+    """MathJax skips <pre> and <code> — verified in a browser — so a page
+    whose only dollars are in code has nothing to typeset. Counting them
+    tagged an article about shell scripts as maths and fetched a megabyte of
+    JavaScript to do nothing with."""
+    shell = ('# Shell\n\n```\nexport PATH="$HOME/bin:$PATH"\n'
+             "awk '{print $1, $3}' log\n```\n\nInline `$PATH` in prose.\n")
+    assert app._has_math_outside_code(shell) is False
+    assert app._has_math_outside_code("# T\n\n~~~\ncost=$1\n~~~\n") is False
+    assert app._has_math_outside_code("Just words, no dollars.") is False
+    # Two inline spans in one sentence: the text between them carries no
+    # dollar and no newline, so the inline-math pattern matches straight
+    # across them unless the spans are taken out first.
+    assert app._has_math_outside_code(
+        "Use `$HOME` and `$PATH` together in the profile.") is False
+    # Real maths still counts, including alongside code.
+    assert app._has_math_outside_code("Zeros at $1/2$.") is True
+    assert app._has_math_outside_code("$$\n\\zeta(s)\n$$") is True
+    assert app._has_math_outside_code(
+        '$E = mc^2$ and\n\n```\necho "$HOME"\n```\n') is True
+
+
+def test_a_shell_article_is_not_tagged_as_maths(tmp_path, monkeypatch):
+    """Both the front-matter tag and the reader ask the same question."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-shell.md").write_text(
+        '---\ntitle: "Shell"\n---\n\n```\nexport PATH="$HOME/bin:$PATH"\n```\n',
+        encoding="utf-8")
+    (tmp_path / "2026-07-19-maths.md").write_text(
+        '---\ntitle: "Maths"\n---\n\nZeros at $1/2$.\n', encoding="utf-8")
+    client = TestClient(app.app)
+    assert "mathjax" not in client.get("/read/2026-07-19-shell.md").text.lower()
+    assert "mathjax" in client.get("/read/2026-07-19-maths.md").text.lower()
+
+    front = app._frontmatter("Shell", "https://example.test/x",
+                             has_math=app._has_math_outside_code(
+                                 '```\nexport PATH="$HOME"\n```\n'))
+    assert "math" not in front.split("tags:")[1].split("\n")[0]
