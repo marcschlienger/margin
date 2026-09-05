@@ -670,9 +670,11 @@ def test_pages_and_files_carry_the_sibling_security_headers(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 
 def test_delete_removes_files_and_index_entry(tmp_path, monkeypatch):
+    """An item lives in one folder — archiving moves its whole family — so
+    deletion happens in one folder too."""
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
-    (tmp_path / "2026-07-19-z.md").write_text("x", encoding="utf-8")
     (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "2026-07-19-z.md").write_text("x", encoding="utf-8")
     (tmp_path / "archive" / "2026-07-19-z.pdf").write_bytes(b"%PDF")
     app._record_url("https://a.test/z", "2026-07-19-z")
 
@@ -680,13 +682,66 @@ def test_delete_removes_files_and_index_entry(tmp_path, monkeypatch):
     r = client.post("/delete", data={"stem": "2026-07-19-z"},
                     follow_redirects=False)
     assert r.status_code == 303
-    assert not (tmp_path / "2026-07-19-z.md").exists()
+    assert not (tmp_path / "archive" / "2026-07-19-z.md").exists()
     assert not (tmp_path / "archive" / "2026-07-19-z.pdf").exists()
     assert app._find_existing("https://a.test/z") is None
     assert app._load_url_index() == {}          # index entry cleaned up
 
     assert client.post("/delete", data={"stem": "../evil"}).status_code == 400
     assert client.post("/delete", data={"stem": "2026-07-19-z"}).status_code == 404
+
+
+def test_deleting_one_item_leaves_its_namesake_alone(tmp_path, monkeypatch):
+    """The inbox and the archive allocate names independently, so both can
+    hold a *different* item under one stem — two pages with the same title
+    saved on the same day. Deleting "the stem wherever it lives" took the
+    unrelated inbox item with it, which is what the archive-only,
+    confirm-prompted UI exists to prevent."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "2026-07-19-same.md").write_text(
+        '---\ntitle: "The inbox one"\n---\nkeep me\n', encoding="utf-8")
+    (tmp_path / "archive" / "2026-07-19-same.md").write_text(
+        '---\ntitle: "The archived one"\n---\ndelete me\n', encoding="utf-8")
+    app._record_url("https://a.test/inbox", "2026-07-19-same")
+
+    client = TestClient(app.app)
+    assert client.post("/delete",
+                       data={"stem": "2026-07-19-same", "view": "archive"},
+                       follow_redirects=False).status_code == 303
+    assert (tmp_path / "2026-07-19-same.md").is_file()          # untouched
+    assert not (tmp_path / "archive" / "2026-07-19-same.md").exists()
+    # And the surviving item keeps its place in the duplicate index.
+    assert app._load_url_index() == {"https://a.test/inbox": ["2026-07-19-same"]}
+
+    # Asked for the inbox one, it goes.
+    assert client.post("/delete",
+                       data={"stem": "2026-07-19-same", "view": "inbox"},
+                       follow_redirects=False).status_code == 303
+    assert not (tmp_path / "2026-07-19-same.md").exists()
+    assert app._load_url_index() == {}
+
+
+def test_an_archived_family_that_collides_takes_its_index_with_it(tmp_path,
+                                                                  monkeypatch):
+    """Archiving onto an occupied name lands the family on "<stem>-2". The
+    index still said "<stem>", which by then is a different item's files —
+    and a PDF-only capture has no front matter to fall back on, so the wrong
+    document would answer for that URL for good."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "2026-07-19-same.pdf").write_bytes(b"%PDF mine")
+    (tmp_path / "archive" / "2026-07-19-same.pdf").write_bytes(b"%PDF someone else")
+    app._record_url("https://a.test/mine", "2026-07-19-same")
+
+    client = TestClient(app.app)
+    assert client.post("/archive",
+                       data={"stem": "2026-07-19-same", "action": "archive"},
+                       follow_redirects=False).status_code == 303
+    assert (tmp_path / "archive" / "2026-07-19-same-2.pdf").is_file()
+    assert app._load_url_index() == {"https://a.test/mine": ["2026-07-19-same-2"]}
+    hit = app._find_existing("https://a.test/mine")
+    assert hit and hit["files"] == ["2026-07-19-same-2.pdf"]
 
 
 def test_delete_button_only_in_archive_view(tmp_path, monkeypatch):
@@ -912,7 +967,9 @@ def test_an_archive_symlink_cannot_read_or_delete_outside_the_root(tmp_path, mon
     (tmp_path / "archive").symlink_to(elsewhere, target_is_directory=True)
     client = TestClient(app.app)
     assert "Outside" not in client.get("/?view=archive").text
-    assert client.post("/delete", data={"stem": victim.stem}).status_code == 404
+    # 409, not 404: "your archive path is a symlink" is the useful answer,
+    # and it is given before anything is looked at, let alone unlinked.
+    assert client.post("/delete", data={"stem": victim.stem}).status_code == 409
     assert victim.is_file()
 
 
@@ -1744,3 +1801,140 @@ def test_the_cookie_follows_the_browsers_scheme_not_ours(monkeypatch, tmp_path):
     spoofed = client.get("/?token=s3cret", follow_redirects=False,
                          headers={"X-Forwarded-Proto": "gopher"})
     assert "Secure" not in spoofed.headers["set-cookie"]
+
+
+# ---------------------------------------------------------------------------
+# A review round's findings, each reproduced before it was fixed
+# ---------------------------------------------------------------------------
+
+def test_an_invited_origin_may_post(tmp_path, monkeypatch):
+    """It gets a successful preflight and then a 403 on the real request:
+    the cross-site guard never consulted the list of origins you allowed, so
+    the documented browser-extension case could not work."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app, "MARGIN_CORS_ORIGINS", ["https://ext.test"])
+    with TestClient(app.app) as client:
+        invited = client.post(
+            "/save-url", json={"url": "http://localtest.me/x"},
+            headers={"Origin": "https://ext.test", "Sec-Fetch-Site": "cross-site"})
+        assert invited.status_code == 200          # refused later, on its merits
+        uninvited = client.post(
+            "/save-url", json={"url": "http://localtest.me/x"},
+            headers={"Origin": "https://evil.test", "Sec-Fetch-Site": "cross-site"})
+        assert uninvited.status_code == 403
+
+
+def test_frontmatter_stops_at_the_closing_delimiter(tmp_path, monkeypatch):
+    """Reading stopped at the chunk holding the closing "---" and then
+    searched the whole chunk, so a source_url: line in the body was read as
+    front matter — and the body is text from somebody else's website."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    path = tmp_path / "2026-07-19-x.md"
+    path.write_text('---\ntitle: "Real"\n---\n\nBody.\n'
+                    'source_url: "https://evil.test/injected"\n', encoding="utf-8")
+    assert app._read_frontmatter_field(path, "title") == "Real"
+    assert app._read_frontmatter_field(path, "source_url") is None
+    # A real one is still read.
+    path.write_text('---\ntitle: "Real"\nsource_url: "https://ok.test/a"\n---\nBody\n',
+                    encoding="utf-8")
+    assert app._read_frontmatter_field(path, "source_url") == "https://ok.test/a"
+
+
+def test_a_hand_added_unicode_file_can_be_archived(tmp_path, monkeypatch):
+    """The stem rule was ASCII-only, so "Über den Rand.md" was listed in the
+    queue and then answered 400 to both Archive and Delete — in a folder the
+    README invites you to drop files into by hand. What makes a stem safe is
+    that it cannot leave the folder, not that it is ASCII."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "Über den Rand.md").write_text(
+        '---\ntitle: "Über den Rand"\n---\nbody\n', encoding="utf-8")
+    client = TestClient(app.app)
+    assert [i["stem"] for i in app._list_items(tmp_path)] == ["Über den Rand"]
+    assert client.post("/archive",
+                       data={"stem": "Über den Rand", "action": "archive"},
+                       follow_redirects=False).status_code == 303
+    assert (tmp_path / "archive" / "Über den Rand.md").is_file()
+    # And nothing that could leave the folder is accepted.
+    for bad in ("../evil", "a/b", "", ".", "..", ".hidden", "with\x00null"):
+        assert not app._safe_stem(bad), bad
+    for good in ("Über den Rand", "2026-07-19-x", "a b.c"):
+        assert app._safe_stem(good), good
+
+
+def test_health_wants_a_directory(tmp_path, monkeypatch):
+    """Pointed at a regular file it reported ok, exists and writable while
+    every save failed."""
+    target = tmp_path / "not-a-dir"
+    target.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(app, "OUTPUT_DIR", target)
+    with TestClient(app.app) as client:
+        body = client.get("/health").json()
+    assert body["output_dir_exists"] is False
+    assert body["output_dir_writable"] is False
+
+
+def test_a_binary_write_does_not_freeze_the_server(tmp_path, monkeypatch):
+    """A PDF is megabytes, and the write is followed by fsync, an atomic
+    replace and a lock. On the loop, a 400ms write stopped an async
+    heartbeat entirely."""
+    import asyncio
+    import time as _time
+
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    real = app._write_bytes_atomically
+    monkeypatch.setattr(app, "_write_bytes_atomically",
+                        lambda path, data: (_time.sleep(0.4), real(path, data))[1])
+
+    async def run():
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def beat():
+            nonlocal ticks
+            while not stop.is_set():
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        heart = asyncio.create_task(beat())
+        await asyncio.sleep(0.05)
+        started = _time.monotonic()
+        await app._write_binary_async("2026-07-19-x.pdf", b"%PDF" * 500)
+        took = _time.monotonic() - started
+        stop.set()
+        await heart
+        return ticks, took
+
+    ticks, took = asyncio.run(run())
+    assert took > 0.3, took
+    assert ticks > took / 0.02 * 0.6, (ticks, took)
+    source = Path(app.__file__).read_text()
+    for line in source.splitlines():
+        assert not line.strip().startswith("pdf_path = _write_binary("), line
+
+
+def test_a_failed_pdf_write_is_a_json_error(tmp_path, monkeypatch):
+    """Outside the branch's error handling, a full disk or a read-only
+    folder left the direct-PDF path answering HTTP 500 instead of the JSON
+    error result the API documents."""
+    source = Path(app.__file__).read_text()
+    branch = source[source.index("if pdf_bytes is not None:"):]
+    branch = branch[:branch.index("if md_formats")]
+    assert "except OSError" in branch
+    assert "_err(" in branch
+
+
+def test_cancelling_the_delete_prompt_keeps_the_offline_copy():
+    """confirm() in an onsubmit attribute cancelled the navigation while a
+    separate submit listener still sent forget-stem: the server kept the
+    item and its offline copy vanished. One listener owns both halves."""
+    source = Path(app.__file__).read_text()
+    assert "onsubmit=" not in source
+    assert 'data-confirm="Delete permanently' in source
+    listener = source[source.index("form[action=\"/delete\"]"):]
+    listener = listener[:listener.index("});\n});") + 8]
+    assert "window.confirm(form.dataset.confirm)" in listener
+    assert "event.preventDefault()" in listener
+    assert "forget-stem" in listener
+    # …and the form says which folder it is deleting from.
+    assert 'name="view"' in source

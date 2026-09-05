@@ -320,7 +320,11 @@ async def _refuse_cross_site_writes(request: Request, call_next):
         and (request.headers.get("sec-fetch-mode") != "navigate"
              or request.headers.get("sec-fetch-dest") != "document")
     )
-    if cross_site and (mutating_request or disguised_write):
+    # An origin named in MARGIN_CORS_ORIGINS is one you decided to trust;
+    # refusing its POST after answering its preflight made the documented
+    # browser-extension case impossible.
+    invited = request.headers.get("origin", "") in MARGIN_CORS_ORIGINS
+    if cross_site and not invited and (mutating_request or disguised_write):
         return JSONResponse(
             {"status": "error", "filename": "",
              "message": "Refused: a cross-site request may not change "
@@ -1563,6 +1567,14 @@ async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
         return None
 
 
+async def _write_binary_async(filename: str, data: bytes) -> Path:
+    """Off the loop: a PDF is megabytes, and the write is followed by fsync,
+    an atomic replace and a lock. Measured with a 400ms write, an async
+    heartbeat stopped entirely — the same reason the multi-format writer was
+    moved off the loop."""
+    return await asyncio.to_thread(_write_binary, filename, data)
+
+
 def _write_binary(filename: str, data: bytes) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with _WRITE_LOCK:
@@ -1908,7 +1920,15 @@ async def save(payload: SavePayload, request: Request):
         title = _clean_title(await _direct_pdf_title(client, payload.url, pdf_bytes))
         stem = None
         if want_pdf:
-            pdf_path = _write_binary(_filename(title, "pdf"), pdf_bytes)
+            # Inside the error handling like every other write. Outside it, a
+            # full disk or a read-only folder left this branch answering HTTP
+            # 500 instead of the JSON error result the API documents.
+            try:
+                pdf_path = await _write_binary_async(_filename(title, "pdf"),
+                                                     pdf_bytes)
+            except OSError as e:
+                _log("save", f"direct-PDF write failed: {e}")
+                return _err(f"Could not write the PDF: {e}")
             saved.append(pdf_path.name)
             stem = pdf_path.stem
             _record_url(payload.url, stem)
@@ -1949,7 +1969,8 @@ async def save(payload: SavePayload, request: Request):
                         f"(status {rendered.status}, title {rendered.title!r})"
                     )
                 title = _clean_title(rendered.title) or payload.url
-                pdf_path = _write_binary(_filename(title, "pdf"), rendered.pdf)
+                pdf_path = await _write_binary_async(
+                    _filename(title, "pdf"), rendered.pdf)
                 saved.append(pdf_path.name)
                 web_stem = pdf_path.stem
                 _record_url(payload.url, pdf_path.stem)
@@ -2025,7 +2046,8 @@ async def save_pdf(file: UploadFile = File(...)):
     stem = None
     if "pdf" in DEFAULT_FORMATS:
         try:
-            pdf_path = _write_binary(_filename(title, "pdf"), pdf_bytes)
+            pdf_path = await _write_binary_async(
+                _filename(title, "pdf"), pdf_bytes)
             saved.append(pdf_path.name)
             stem = pdf_path.stem
         except Exception as e:
@@ -2230,7 +2252,17 @@ async def save_page(request: Request, url: str = "",
 
 _SERVE_EXTS = (".pdf", ".md", ".tex", ".org")  # order = display order
 _ARCHIVE_SUBDIR = "archive"
-_RE_SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
+# A stem names files inside one folder, so what makes it safe is that it
+# cannot leave that folder — not that it is ASCII. The old rule was
+# ^[A-Za-z0-9][A-Za-z0-9._ -]*$, which listed "Über den Rand.md" in the queue
+# and then answered 400 to both Archive and Delete, in a folder the README
+# invites you to drop files into by hand.
+_RE_UNSAFE_STEM = re.compile(r"[/\\]|[\x00-\x1f\x7f]")
+
+
+def _safe_stem(stem: str) -> bool:
+    return bool(stem) and stem not in (".", "..") and not stem.startswith(".") \
+        and _RE_UNSAFE_STEM.search(stem) is None
 
 # Placeholders (__ROWS__ etc.) are substituted with str.replace, so the CSS
 # and JS braces below need no escaping.
@@ -2275,7 +2307,15 @@ if ('serviceWorker' in navigator) {
 // only fires if someone asks for the file again, and offline that may never
 // happen — so a deleted page would stay readable for ever.
 document.querySelectorAll('form[action="/delete"]').forEach(function (form) {
-  form.addEventListener('submit', function () {
+  form.addEventListener('submit', function (event) {
+    // One listener owns both halves. With confirm() in an onsubmit attribute
+    // and the message in a listener of its own, cancelling stopped the
+    // navigation and sent forget-stem anyway: the server kept the item and
+    // its offline copy vanished.
+    if (!window.confirm(form.dataset.confirm)) {
+      event.preventDefault();
+      return;
+    }
     const stem = form.querySelector('input[name=stem]').value;
     if (navigator.serviceWorker && navigator.serviceWorker.controller) {
       navigator.serviceWorker.controller.postMessage(
@@ -2373,6 +2413,10 @@ def _pretty_stem(stem: str) -> str:
     return re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem).replace("-", " ") or stem
 
 
+_RE_FRONTMATTER = re.compile(r"\A---\r?\n(.*?)^---[ \t]*\r?$",
+                             re.DOTALL | re.MULTILINE)
+
+
 def _read_frontmatter_field(md_path: Path, field: str) -> str | None:
     try:
         chunks: list[str] = []
@@ -2388,7 +2432,14 @@ def _read_frontmatter_field(md_path: Path, field: str) -> str | None:
         head = "".join(chunks)
     except OSError:
         return None
-    m = re.search(rf'^{field}:\s*"?(.*?)"?\s*$', head, re.MULTILINE)
+    # Only the block between the delimiters. Reading stopped at the chunk
+    # that contained the closing "---" and then searched the whole chunk, so
+    # a "source_url:" line in the body was read as front matter — and the
+    # body of a saved page is text from somebody else's website.
+    block = _RE_FRONTMATTER.match(head)
+    if block is None:
+        return None
+    m = re.search(rf'^{field}:\s*"?(.*?)"?\s*$', block.group(1), re.MULTILINE)
     if not m:
         return None
     return m.group(1).replace('\\"', '"').replace("\\\\", "\\")
@@ -2442,8 +2493,9 @@ def _item_row(item: dict, view: str) -> str:
     # is a deliberate two-step, and the confirm() guards against slips.
     delete_form = "" if view != "archive" else f"""
       <form method="post" action="/delete"
-            onsubmit="return confirm('Delete permanently? This cannot be undone.')">
+            data-confirm="Delete permanently? This cannot be undone.">
         <input type="hidden" name="stem" value="{_html_escape(item["stem"], True)}">
+        <input type="hidden" name="view" value="{_html_escape(view, True)}">
         <button type="submit" class="linkish danger">delete</button>
       </form>"""
     return f"""<article class="item">
@@ -2792,8 +2844,30 @@ async def read_file(name: str):
     return HTMLResponse(page)
 
 
+def _rename_stem(old: str, new: str) -> None:
+    """Follow a family that a collision moved to a different stem."""
+    idx = _load_url_index()
+    changed = False
+    for url, stems in idx.items():
+        if old in stems:
+            idx[url] = [new if s == old else s for s in stems]
+            changed = True
+    if changed:
+        try:
+            _write_json_atomically(_url_index_path(), idx)
+        except OSError as e:
+            _log("index", f"could not write URL index: {e}")
+
+
 def _forget_stem(stem: str) -> None:
-    """Drop a deleted item's stem from the duplicate-URL index."""
+    """Drop a deleted item's stem from the duplicate-URL index.
+
+    Only once no file carries it any more: the two folders name items
+    independently, so deleting the archived copy of "same" can leave an
+    unrelated inbox item of that name still standing.
+    """
+    if _files_for_stems({stem}):
+        return
     idx = _load_url_index()
     changed = False
     for url in list(idx):
@@ -2810,23 +2884,27 @@ def _forget_stem(stem: str) -> None:
 
 
 @app.post("/delete")
-async def delete_item(stem: str = Form(...)):
-    """Permanently delete all files of one saved item (inbox and archive/).
+async def delete_item(stem: str = Form(...), view: str = Form("archive")):
+    """Permanently delete one saved item, in one folder.
 
-    The queue UI only offers this from the archive view (inbox → archive →
-    delete, with a confirm prompt), but the endpoint itself removes the stem
-    wherever it lives.
+    One folder, because the inbox and the archive allocate names
+    independently and can both hold a different item under the same stem —
+    two captures of pages with the same title on the same day. Deleting "the
+    stem wherever it lives" then took an unrelated inbox item with it, which
+    is what the archive-only, confirm-prompted UI was meant to prevent.
     """
-    if not _RE_SAFE_STEM.match(stem):
+    if not _safe_stem(stem):
         raise HTTPException(400, detail="invalid stem")
+    folder = _archive_dir() if view == "archive" else OUTPUT_DIR
+    if not _storage_folder_safe(folder):
+        raise HTTPException(409, detail="storage path is not a safe directory")
     removed = 0
-    for folder in (OUTPUT_DIR, _archive_dir()):
-        if folder.is_dir() and _storage_folder_safe(folder):
-            for f in list(folder.iterdir()):
-                if (f.is_file() and _inside(f, folder) and f.stem == stem
-                        and f.suffix.lower() in _SERVE_EXTS):
-                    f.unlink()
-                    removed += 1
+    if folder.is_dir():
+        for f in list(folder.iterdir()):
+            if (f.is_file() and _inside(f, folder) and f.stem == stem
+                    and f.suffix.lower() in _SERVE_EXTS):
+                f.unlink()
+                removed += 1
     if not removed:
         raise HTTPException(404, detail=f"no files found for {stem!r}")
     _forget_stem(stem)
@@ -2837,7 +2915,7 @@ async def delete_item(stem: str = Form(...)):
 @app.post("/archive")
 async def archive(stem: str = Form(...), action: str = Form("archive")):
     """Move all files of one saved item between the inbox and archive/."""
-    if not _RE_SAFE_STEM.match(stem):
+    if not _safe_stem(stem):
         raise HTTPException(400, detail="invalid stem")
     if action == "restore":
         src, dst, back = _archive_dir(), OUTPUT_DIR, "/?view=archive"
@@ -2857,6 +2935,13 @@ async def archive(stem: str = Form(...), action: str = Form("archive")):
             for f in files:
                 f.rename(dst / f"{target.stem}{f.suffix.lower()}")
                 moved += 1
+            # The destination may already hold that name, in which case the
+            # family lands on "<stem>-2" — and the URL index still pointed at
+            # "<stem>", which by then is a different item's files. A PDF-only
+            # capture has no front matter to fall back on, so the wrong
+            # document would answer for the URL for good.
+            if target.stem != stem:
+                _rename_stem(stem, target.stem)
     if not moved:
         raise HTTPException(404, detail=f"no files found for {stem!r}")
     _log("archive", f"{action} {stem} ({moved} files)")
@@ -2865,7 +2950,9 @@ async def archive(stem: str = Form(...), action: str = Form("archive")):
 
 @app.get("/health")
 async def health(request: Request):
-    exists = OUTPUT_DIR.exists()
+    # is_dir, not exists: pointed at a regular file, health reported ok,
+    # exists and writable while every save failed.
+    exists = OUTPUT_DIR.is_dir()
     # The path itself is not reported: /health is public (it has to be, for
     # a probe that carries no credentials), and on a real install the path
     # names the account it runs as. Whether it works is the useful part.
