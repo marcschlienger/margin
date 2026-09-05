@@ -23,6 +23,7 @@ and `Renderer.available` reports whether rendering is possible. Install with:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from dataclasses import dataclass
 from typing import Callable
@@ -166,7 +167,12 @@ class Renderer:
             try:
                 if self._url_allowed is not None:
                     async def enforce_url_policy(route):
-                        if self._url_allowed(route.request.url):
+                        # The gate may need to resolve a name to answer, so
+                        # it is allowed to be a coroutine.
+                        verdict = self._url_allowed(route.request.url)
+                        if inspect.isawaitable(verdict):
+                            verdict = await verdict
+                        if verdict:
                             await route.continue_()
                         else:
                             await route.abort("blockedbyclient")

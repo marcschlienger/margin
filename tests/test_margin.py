@@ -370,10 +370,113 @@ def test_http_redirects_are_checked_before_the_next_request(monkeypatch):
 
 
 def test_browser_policy_checks_redirects_and_subresources(monkeypatch):
+    """The syntactic half. Resolution is stubbed so the test does not need a
+    resolver; it has a test of its own below."""
+    import asyncio
+
     monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", False)
-    assert app._browser_url_allowed("https://example.com/page")
-    assert app._browser_url_allowed("data:text/plain,ok")
-    assert not app._browser_url_allowed("http://127.0.0.1/private")
+
+    async def resolves(host, port):
+        return True
+
+    monkeypatch.setattr(app, "_host_resolves_public", resolves)
+    allowed = lambda url: asyncio.run(app._browser_url_allowed(url))  # noqa: E731
+    assert allowed("https://example.com/page")
+    assert allowed("data:text/plain,ok")
+    assert not allowed("http://127.0.0.1/private")
+    assert not allowed("file:///etc/passwd")
+
+
+def _with_resolver(monkeypatch, mapping):
+    """Answer getaddrinfo from a dict, so no test needs a resolver."""
+    import socket as _socket
+
+    async def fake(host, port, *args, **kwargs):
+        if host not in mapping:
+            raise OSError("name or service not known")
+        return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", (addr, port or 80))
+                for addr in mapping[host]]
+
+    class Loop:
+        getaddrinfo = staticmethod(fake)
+
+    monkeypatch.setattr(app.asyncio, "get_running_loop", lambda: Loop())
+    app._resolved.clear()
+
+
+def test_a_name_that_resolves_inward_is_refused(monkeypatch):
+    """is_public_http_url answers "a name; the resolver decides", and nothing
+    asked the resolver — so the address checks only ever stopped literal IPs,
+    which is the one form nobody has to use. Demonstrated against a running
+    instance with localtest.me, a free public service resolving to 127.0.0.1:
+    POST /save-url fetched this server's own /health and filed the answer."""
+    import asyncio
+
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", False)
+    _with_resolver(monkeypatch, {
+        "localtest.me": ["127.0.0.1"],
+        "sneaky.test": ["93.184.216.34", "10.0.0.5"],   # one of each
+        "tailnet.test": ["100.64.0.1"],                 # carrier-grade NAT
+        "example.com": ["93.184.216.34"],
+        "v6.test": ["::1"],
+    })
+    outward = lambda url: asyncio.run(app._url_points_outward(url))  # noqa: E731
+
+    assert outward("https://example.com/a") is True
+    assert outward("http://localtest.me:8060/health") is False
+    assert outward("http://sneaky.test/x") is False     # every address must pass
+    assert outward("http://tailnet.test/x") is False
+    assert outward("http://nowhere.test/x") is False    # unresolvable
+    # And an operator who says they want private addresses still gets them.
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", True)
+    assert outward("http://localtest.me:8060/health") is True
+
+
+def test_the_outbound_hook_refuses_a_name_that_points_inward(monkeypatch):
+    """Every request the client makes goes through the hook, redirects
+    included — so this is where the answer has to be enforced, not only in
+    the validator that runs once on the way in."""
+    import asyncio
+    import httpx
+
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", False)
+    _with_resolver(monkeypatch, {"localtest.me": ["127.0.0.1"],
+                                 "example.com": ["93.184.216.34"]})
+
+    async def run(url):
+        request = httpx.Request("GET", url)
+        await app._validate_outbound_request(request)
+
+    asyncio.run(run("https://example.com/a"))          # no exception
+    with pytest.raises(httpx.RequestError, match="resolves inside"):
+        asyncio.run(run("http://localtest.me:8060/health"))
+
+
+def test_a_resolved_verdict_is_remembered_briefly(monkeypatch):
+    """An image-heavy page must not resolve one host a hundred times."""
+    import asyncio
+    import socket as _socket
+
+    calls = []
+
+    async def fake(host, port, *args, **kwargs):
+        calls.append(host)
+        return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, "",
+                 ("93.184.216.34", port or 80))]
+
+    class Loop:
+        getaddrinfo = staticmethod(fake)
+
+    monkeypatch.setattr(app.asyncio, "get_running_loop", lambda: Loop())
+    app._resolved.clear()
+
+    async def run():
+        for _ in range(5):
+            assert await app._host_resolves_public("example.com", 443) is True
+
+    asyncio.run(run())
+    assert calls == ["example.com"], calls
+    app._resolved.clear()
 
 
 # ---------------------------------------------------------------------------

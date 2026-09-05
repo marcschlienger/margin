@@ -377,6 +377,44 @@ patterns are merged into `$X_{n}$`.
 
 ---
 
+## Where the server may be sent, continued
+
+The address checks refuse loopback, private, link-local, carrier-grade NAT
+and the shorthands a resolver accepts — and until this landed they only ever
+applied to literal addresses. `is_public_http_url` answers "a name; the
+resolver decides", and nothing then asked the resolver. That is not the
+rebinding race it was first taken for; it is a plain bypass, and it needs no
+attacker infrastructure: `localtest.me` is a free public service that
+resolves to `127.0.0.1`. Demonstrated against a running instance —
+`POST /save-url` with `http://localtest.me:8060/health` fetched the server's
+own health endpoint and filed the answer in the output folder, where the
+queue reads it.
+
+So the policy has two halves now. `_url_points_outward` applies the URL's own
+form *and* resolves the host, refusing unless **every** address it gets back
+is on the open internet — one public answer beside one private answer is a
+refusal, because the connection may use either. An unresolvable name is
+refused too: it is unreachable anyway, so nothing is lost. Both halves run in
+the HTTPX event hook, which sees every request the client makes including
+redirects, and in the gate Chromium's route handler consults for the main
+navigation and every subresource.
+
+Verdicts are remembered for a minute, so an image-heavy page does not resolve
+one host a hundred times. That deliberately leaves the genuine rebinding race
+open — a name that answers publicly now and inward a moment later — because
+closing it means connecting to the address that was checked rather than to
+the name, carrying the Host header and TLS SNI across. Against a token on a
+private network that is not the trade to make yet.
+
+Two consequences worth knowing. The check for Chromium is advisory on the
+address: the browser does its own DNS and this cannot pin what it connects
+to; what it does stop is a public page naming a host that resolves inward and
+using the browser as the bridge. And a Tailscale address is `100.64.0.0/10`
+or `fd7a:115c:a1e0::/48`, neither of which is global — so saving from a
+machine on your own tailnet needs `MARGIN_ALLOW_PRIVATE_URLS=1`, which also
+reopens loopback. If both mattered at once, the honest shape would be a list
+of permitted networks rather than one switch.
+
 ## Deciding whether a page is maths
 
 Margin is a general read-later service that happens to be very good at maths,

@@ -1254,6 +1254,78 @@ def _as_address(host: str):
         return None
 
 
+def _address_is_public(address: str) -> bool:
+    """The same test is_public_http_url applies, on a resolved address."""
+    parsed = _as_address(address)
+    if parsed is None:
+        return False
+    return (parsed.is_global and not parsed.is_multicast
+            and not getattr(parsed, "is_site_local", False))
+
+
+_RESOLVE_TTL_S = 60.0
+_RESOLVE_MAX = 256
+_resolved: dict = {}
+
+
+async def _host_resolves_public(host: str, port: int) -> bool:
+    """Whether every address this name resolves to is on the open internet.
+
+    is_public_http_url answers "a name; the resolver decides", and nothing
+    ever asked the resolver — so the address checks only ever stopped literal
+    IPs, which is the one form nobody has to use. Not a rebinding race, a
+    plain bypass: localtest.me is a free public service resolving to
+    127.0.0.1, and POST /save-url with http://localtest.me:<port>/health
+    fetched this server's own health endpoint and filed the answer in the
+    output folder where the queue reads it.
+
+    Verdicts are kept for a minute so an image-heavy page does not resolve
+    one host a hundred times. That leaves the genuine rebinding race open — a
+    name that answers publicly now and inward a moment later — which closing
+    properly means connecting to the address that was checked rather than to
+    the name, with the Host header and TLS SNI carried across.
+    """
+    key = (host, port)
+    now = time.monotonic()
+    seen = _resolved.get(key)
+    if seen is not None and now - seen[1] < _RESOLVE_TTL_S:
+        return seen[0]
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port or None, proto=socket.IPPROTO_TCP)
+    except (OSError, ValueError):
+        return False            # unresolvable is unreachable; refusing is free
+    verdict = bool(infos) and all(
+        _address_is_public(info[4][0]) for info in infos)
+    _resolved[key] = (verdict, now)
+    while len(_resolved) > _RESOLVE_MAX:
+        _resolved.pop(next(iter(_resolved)))
+    return verdict
+
+
+def _default_port(scheme: str) -> int:
+    return 443 if scheme.lower() == "https" else 80
+
+
+async def _url_points_outward(url: str) -> bool:
+    """The full policy: the URL's own form, and where its name resolves."""
+    if ALLOW_PRIVATE_URLS:
+        return True
+    try:
+        _validated_url(url)
+    except (TypeError, ValueError):
+        return False
+    host = _ascii_host(url)
+    if not host:
+        return False
+    parsed = urlparse(url)
+    try:
+        port = parsed.port or _default_port(parsed.scheme)
+    except ValueError:
+        return False
+    return await _host_resolves_public(host, port)
+
+
 def is_public_http_url(url: str) -> bool:
     """An http(s) URL that points at the open internet."""
     host = (_ascii_host(url) or "").lower()
@@ -1291,7 +1363,12 @@ def _validated_url(v: str) -> str:
 
 
 async def _validate_outbound_request(request: httpx.Request) -> None:
-    """Apply the URL policy to every HTTPX request, including redirects."""
+    """Apply the URL policy to every HTTPX request, including redirects.
+
+    Both halves: the URL's own form, and the addresses its name resolves to.
+    The first alone let any hostname through, which is the whole of the
+    bypass — a name is exactly how you reach 127.0.0.1 without writing it.
+    """
     url = str(request.url)
     try:
         _validated_url(url)
@@ -1300,19 +1377,27 @@ async def _validate_outbound_request(request: httpx.Request) -> None:
             f"outbound URL violates Margin's policy: {exc}",
             request=request,
         ) from None
+    if not await _url_points_outward(url):
+        raise httpx.RequestError(
+            "outbound URL resolves inside this machine or its network: "
+            f"{request.url.host}",
+            request=request,
+        ) from None
 
 
-def _browser_url_allowed(url: str) -> bool:
+async def _browser_url_allowed(url: str) -> bool:
+    """The same policy for everything Chromium fetches, redirects included.
+
+    Advisory for the address itself — Chromium does its own DNS, so this
+    cannot pin what it connects to — but it is what stops a public page from
+    naming a host that resolves inward and using the browser as the bridge.
+    """
     scheme = urlparse(url).scheme.lower()
     if scheme in ("data", "blob", "about"):
         return True
     if scheme not in ("http", "https"):
         return False
-    try:
-        _validated_url(url)
-        return True
-    except (TypeError, ValueError):
-        return False
+    return await _url_points_outward(url)
 
 
 class URLPayload(BaseModel):

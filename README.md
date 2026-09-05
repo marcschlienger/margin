@@ -271,7 +271,9 @@ credentials. It does **not** report where the output directory is: the path
 names the account the service runs as, and whether the folder works is the
 useful half.
 
-**Margin will not fetch its own network.** It saves whatever URL it is given
+**Margin will not fetch its own network.** Names are resolved and checked,
+not just addresses — `localtest.me` resolves to `127.0.0.1`, so checking the
+spelling alone stopped nothing. It saves whatever URL it is given
 and then serves the result back through `/read`, so an address inside the
 machine — loopback, `10.x`, `192.168.x`, link-local, cloud metadata — would
 be a way to read those services *through* Margin, and with no token that is
