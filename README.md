@@ -331,24 +331,81 @@ special-casing, no port forwarding, no dynamic DNS.
 
 **4. Choose how tight to lock it down.** Two good setups:
 
-- **Simple (recommended):** keep the default bind (`0.0.0.0`), set
-  `MARGIN_TOKEN`. Reachable on LAN and tailnet, but every request needs the
-  token. On a tailnet you share with others, also restrict port 8000 to your
-  own devices in the Tailscale admin ACLs.
-- **Tailnet-only + HTTPS:** bind Margin to loopback and let Tailscale proxy
-  it with a real TLS certificate:
+- **Simple:** keep the default bind (`0.0.0.0`), set `MARGIN_TOKEN`.
+  Reachable on LAN and tailnet, but every request needs the token. On a
+  tailnet you share with others, also restrict port 8000 to your own devices
+  in the Tailscale admin ACLs. Note what this costs: a plain-`http://`
+  address that is not `localhost` is not a **secure context**, and browsers
+  withhold whole APIs there. Measured in Chromium against
+  `http://192.168.1.42:8000`, `'serviceWorker' in navigator` is `false` —
+  not refused, absent — so **offline reading never activates**, and
+  `navigator.clipboard` and `navigator.canShare` are undefined too. Margin
+  copes (Copy falls back to the selection route, Share hides itself), but
+  the queue and your saved pages are unavailable without a signal.
+- **Tailnet-only + HTTPS (recommended):** bind Margin to loopback and let
+  Tailscale proxy it with a real TLS certificate. This is what turns offline
+  reading on:
 
   ```bash
   # in /etc/margin/<user>.env: HOST=127.0.0.1
   sudo systemctl daemon-reload && sudo systemctl restart margin@<user>
-  sudo tailscale serve --bg 8000
+  sudo tailscale serve --bg --https=443 8000
+  tailscale serve status
   ```
 
-  Margin is now at `https://<machine>.<your-tailnet>.ts.net` (no port, note
-  the **https**) and unreachable from the LAN or anywhere outside the
-  tailnet. The HTTPS URL has a bonus: browsers no longer treat the server as
-  mixed content, so `fetch()`-based clients and extensions work from https
-  pages too. `MARGIN_TOKEN` is still worth setting on shared tailnets.
+  Enable HTTPS certificates for the tailnet once first (admin console → DNS →
+  HTTPS Certificates); `serve` cannot get a certificate without it. Then
+  `tailscale serve status` should show the mapping, and Margin is at
+  `https://<machine>.<your-tailnet>.ts.net` (no port, note the **https**),
+  unreachable from the LAN or anywhere outside the tailnet. `serve` is not
+  `funnel`: nothing is exposed to the internet.
+
+  That URL is a secure context, so the service worker registers and a page
+  you have opened once is readable with no network at all. It also stops
+  browsers treating the server as mixed content, so `fetch()`-based clients
+  and extensions work from https pages too. `MARGIN_TOKEN` is still worth
+  setting on shared tailnets.
+
+  Tailscale terminates TLS and speaks plain HTTP to Margin on loopback, so
+  the app cannot see that the browser is on HTTPS. It reads
+  `X-Forwarded-Proto` for that, which is what lets the auth cookie carry
+  `Secure` on a site the browser considers secure.
+
+  **Running Footnote on the same machine?** Give each its own HTTPS port —
+  `--https=443` for one, `--https=8443` for the other (Tailscale allows 443,
+  8443 and 10000):
+
+  ```bash
+  sudo tailscale serve --bg --https=443  8000   # Margin
+  sudo tailscale serve --bg --https=8443 8010   # Footnote
+  ```
+
+  Do **not** put them on one name under different paths with `--set-path`:
+  both apps address everything from the root (`/static/style.css`,
+  `/manifest.json`, `/read/…`, `/files/…`, the `/archive` and `/delete`
+  forms), and a service worker's scope is the directory it is served from, so
+  one served under `/margin/` could not control its own pages.
+
+  **Then, on each device** — easy to miss, and none of it is optional:
+
+  1. Open the new URL once with `?token=…` to store the cookie.
+  2. **Re-add the home-screen app from the HTTPS URL and delete the old one.**
+     A PWA keeps the origin it was installed from, and service workers and
+     caches are per-origin: the existing install will never read offline.
+  3. Update the iOS Shortcuts and the bookmarklet to the HTTPS URL.
+
+  **Can you still reach it over plain HTTP?** Yes — leave `HOST=0.0.0.0`
+  (the default) instead of binding to loopback, and `serve` will proxy to the
+  same port while the tailnet and LAN addresses keep working. Two things
+  follow. The two addresses are two *origins*, so each has its own service
+  worker cache, PWA install, cookie and `localStorage` (which is where the
+  format checkboxes remember themselves); only the HTTPS one reads offline.
+  And do not use the **same hostname** over both schemes: a `Secure` cookie
+  is only sent to a URI whose scheme is secure
+  ([RFC 6265 §5.4](https://www.rfc-editor.org/rfc/rfc6265#section-5.4)), so
+  the HTTPS session's cookie is never sent over `http://` to that host and
+  you would be re-authenticating constantly. Use the machine name for HTTPS
+  and the tailnet IP for HTTP, and they stay independent.
 
 The iOS Shortcuts, the bookmarklet, and `curl` all work unchanged over
 Tailscale — only the address (and with `tailscale serve`, the scheme)
@@ -473,7 +530,10 @@ Tailscale, WireGuard) and/or use the per-instance `MARGIN_TOKEN` — see
 - **The built-in queue page** — open `http://YOUR-SERVER:8000/` in any
   browser: paste a URL to save, read via the file links, archive when done.
   A page you have opened once stays readable with no network at all, and the
-  queue itself falls back to the last list it saw, saying so when it does.
+  queue itself falls back to the last list it saw, saying so when it does —
+  this needs a **secure context**, so `https://` or `localhost`; over a
+  plain-`http://` LAN or tailnet address browsers do not offer service
+  workers at all. See the Tailscale section for the one-line way to get one.
   On iPhone/iPad, Safari's Share → **Add to Home Screen** installs it as a
   full-screen app with the Margin icon; with `MARGIN_TOKEN` set, the
   installed app prompts for the token once on first launch (its cookie

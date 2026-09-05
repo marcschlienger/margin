@@ -552,7 +552,16 @@ not worth the machinery.
 ## Offline reading
 
 The point of a read-later queue is the train, and until there was a service
-worker the home-screen app was a blank page without a signal. Two kinds of
+worker the home-screen app was a blank page without a signal.
+
+**It needs a secure context, which a plain-`http://` LAN or tailnet address
+is not.** Measured in Chromium against `http://192.168.1.42:8000`:
+`isSecureContext` is false and `'serviceWorker' in navigator` is *false* —
+the API is absent rather than refused, so registration is not attempted and
+nothing is cached. `navigator.clipboard` and `navigator.canShare` are
+undefined there too, which is why Copy has a selection-route fallback and
+Share hides itself. `tailscale serve` (or any TLS front) is what turns all
+of it on; loopback counts as secure, which is why the browser tests see it. Two kinds of
 response age quite differently, so `static/service-worker.js` gives each its
 own policy:
 

@@ -1718,3 +1718,29 @@ def test_a_shell_article_is_not_tagged_as_maths(tmp_path, monkeypatch):
                              has_math=app._has_math_outside_code(
                                  '```\nexport PATH="$HOME"\n```\n'))
     assert "math" not in front.split("tags:")[1].split("\n")[0]
+
+
+def test_the_cookie_follows_the_browsers_scheme_not_ours(monkeypatch, tmp_path):
+    """Behind `tailscale serve` the app sees plain HTTP on loopback while the
+    browser is on https://…ts.net, so the scheme we see is exactly the one
+    that cannot answer the question. The proxy leaves a header that can."""
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    client = TestClient(app.app)
+
+    plain = client.get("/?token=s3cret", follow_redirects=False)
+    assert "margin_token=" in plain.headers.get("set-cookie", "")
+    assert "Secure" not in plain.headers["set-cookie"]      # a plain-HTTP LAN
+
+    behind = client.get("/?token=s3cret", follow_redirects=False,
+                        headers={"X-Forwarded-Proto": "https"})
+    assert "Secure" in behind.headers["set-cookie"]
+
+    # A chain of proxies leaves a list; the client-facing one is first.
+    chained = client.get("/?token=s3cret", follow_redirects=False,
+                         headers={"X-Forwarded-Proto": "https, http"})
+    assert "Secure" in chained.headers["set-cookie"]
+    # And nothing is invented from a header that does not say https.
+    spoofed = client.get("/?token=s3cret", follow_redirects=False,
+                         headers={"X-Forwarded-Proto": "gopher"})
+    assert "Secure" not in spoofed.headers["set-cookie"]

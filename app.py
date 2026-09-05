@@ -220,6 +220,27 @@ in a browser cookie afterwards. (API clients: send an
 </body></html>"""
 
 
+def _request_is_secure(request: Request) -> bool:
+    """Whether the *browser's* connection is TLS, which is not ours.
+
+    Behind `tailscale serve` — or any proxy that terminates TLS — the app
+    sees plain HTTP on loopback while the browser is on https://…ts.net. So
+    request.url.scheme says "http" and the cookie went out without Secure on
+    a site the browser considers HTTPS. The forwarded header is what the
+    proxy leaves behind to say otherwise.
+
+    Trusting it costs nothing here: a cookie is only ever set on a request
+    that already carried the right token, so nobody without it can provoke
+    one. And where no proxy sets the header, this answers exactly what
+    request.url.scheme answered before.
+    """
+    if request.url.scheme == "https":
+        return True
+    # A chain of proxies leaves a list; the client-facing one is first.
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    return forwarded.split(",")[0].strip().lower() == "https"
+
+
 def _request_token(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
@@ -345,7 +366,7 @@ async def _require_token(request: Request, call_next):
         response.set_cookie(
             _TOKEN_COOKIE, MARGIN_TOKEN, max_age=365 * 24 * 3600,
             httponly=True, samesite="strict",
-            secure=request.url.scheme == "https",
+            secure=_request_is_secure(request),
         )
         return response
     return await call_next(request)
