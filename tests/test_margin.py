@@ -1249,3 +1249,288 @@ def test_deleting_tells_the_worker_before_it_navigates(tmp_path, monkeypatch):
     assert "forget-stem" in page
     worker = (Path(app.__file__).parent / "static" / "service-worker.js").read_text()
     assert '"forget-stem"' in worker
+
+
+def test_a_compressed_pdf_cannot_outgrow_its_cap(monkeypatch):
+    """httpx's aiter_bytes hands over what the decoder produced, so a cap
+    counted there bounds bytes that already exist — and how many belongs to
+    whoever compressed them. Measured against 300 MB of zeros in 299 kB of
+    gzip: a 10 MB cap peaked at 142.9 MiB reading it the old way, and 21.2
+    MiB reading the wire raw and expanding under a bound."""
+    import asyncio
+    import gzip
+    import httpx
+
+    cap = 1 * 1024 * 1024
+    monkeypatch.setattr(app, "MAX_DOWNLOAD_BYTES", cap)
+    body = gzip.compress(b"%PDF-1.4\n" + b"0" * (40 * cap))
+
+    async def run():
+        async def serve(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n"
+                         b"Content-Encoding: gzip\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                         % len(body))
+            writer.write(body)
+            try:
+                await writer.drain()
+            except Exception:                                  # noqa: BLE001
+                return
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                return await app._fetch_pdf_bytes(
+                    client, f"http://127.0.0.1:{port}/x.pdf")
+            finally:
+                server.close()
+
+    import gc
+    import tracemalloc
+
+    gc.collect()
+    tracemalloc.start()
+    with pytest.raises(RuntimeError, match="exceeds"):
+        asyncio.run(run())
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    # The assertion that matters is the *size* of the refusal, not the
+    # refusal: reading the decoded stream also raises, having already built
+    # the megabytes. Bounded, the peak follows the cap; unbounded, it follows
+    # whoever did the compressing.
+    assert peak < 6 * cap, f"{peak / 2 ** 20:.1f} MiB against a {cap} byte cap"
+
+    # The wire is read raw, and anything encoded is expanded with a limit —
+    # not handed to a decoder that decides how much to produce.
+    source = Path(app.__file__).read_text()
+    fetch = source[source.index("async def _fetch_pdf_bytes("):]
+    fetch = fetch[:fetch.index("\n\n\n")]
+    assert "aiter_raw()" in fetch and "aiter_bytes()" not in fetch
+    assert "_inflate(" in fetch
+
+
+def test_an_uncompressed_pdf_still_downloads(monkeypatch):
+    import asyncio
+    import httpx
+
+    monkeypatch.setattr(app, "MAX_DOWNLOAD_BYTES", 8 * 1024 * 1024)
+    body = b"%PDF-1.4\n" + b"0" * (64 * 1024)
+
+    async def run():
+        async def serve(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                         % len(body))
+            writer.write(body)
+            try:
+                await writer.drain()
+            except Exception:                                  # noqa: BLE001
+                return
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                return await app._fetch_pdf_bytes(
+                    client, f"http://127.0.0.1:{port}/x.pdf")
+            finally:
+                server.close()
+
+    assert asyncio.run(run()) == body
+
+
+def test_a_gzipped_pdf_within_the_cap_still_arrives(monkeypatch):
+    """Refusing every coding would send a real PDF URL down the render path,
+    which produces a picture of a PDF viewer. So they are expanded, bounded."""
+    import asyncio
+    import gzip
+    import httpx
+
+    monkeypatch.setattr(app, "MAX_DOWNLOAD_BYTES", 8 * 1024 * 1024)
+    plain = b"%PDF-1.4\n" + b"0" * (64 * 1024)
+    body = gzip.compress(plain)
+
+    async def run():
+        async def serve(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n"
+                         b"Content-Encoding: gzip\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                         % len(body))
+            writer.write(body)
+            try:
+                await writer.drain()
+            except Exception:                                  # noqa: BLE001
+                return
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                return await app._fetch_pdf_bytes(
+                    client, f"http://127.0.0.1:{port}/x.pdf")
+            finally:
+                server.close()
+
+    assert asyncio.run(run()) == plain
+
+
+def test_a_save_does_not_freeze_the_server(tmp_path, monkeypatch):
+    """Pandoc is subprocess.run(timeout=30) and Margin asks for .tex and
+    .org, so writing a save used to hold the event loop for as long as it
+    took — no /health, no queue, no second save. Measured before: a 3.0s
+    write let the loop run 4 ticks where it should have run about 64."""
+    import asyncio
+    import time as _time
+
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app, "_run_pandoc",
+                        lambda args, label: (_time.sleep(0.6), (-1, "", "stub"))[1])
+
+    async def run():
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            nonlocal ticks
+            while not stop.is_set():
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.05)
+        started = _time.monotonic()
+        # Exactly how the handlers call it.
+        await asyncio.to_thread(app._write_all_formats, "2026-07-19-x.md",
+                                "# Body\n\ntext\n", "X", ("md", "tex", "org"))
+        took = _time.monotonic() - started
+        stop.set()
+        await beat
+        return ticks, took
+
+    ticks, took = asyncio.run(run())
+    assert took > 0.5, took                  # the stub really did block
+    # Most of the ticks it could have had, not a handful.
+    assert ticks > took / 0.02 * 0.6, (ticks, took)
+
+    # And the handlers do call it that way.
+    source = Path(app.__file__).read_text()
+    assert source.count("asyncio.to_thread(\n                _write_all_formats") \
+        + source.count("asyncio.to_thread(\n            _write_all_formats") \
+        + source.count("asyncio.to_thread(\n                    _write_all_formats") == 3
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("written = _write_all_formats("):
+            raise AssertionError("a handler still writes on the event loop")
+
+
+def test_two_saves_cannot_claim_the_same_stem(tmp_path, monkeypatch):
+    """Choosing a stem looks at what exists and writing creates it. Once the
+    writing moved off the event loop those two steps could interleave."""
+    import threading
+
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app, "_run_pandoc", lambda args, label: (-1, "", ""))
+    results = []
+
+    def save(n):
+        results.append(app._write_all_formats(
+            "2026-07-19-same.md", f"# Body {n}\n", "Same", ("md",)))
+
+    threads = [threading.Thread(target=save, args=(n,)) for n in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    written = [p for group in results for p in group]
+    assert len(written) == 6
+    assert len({p.name for p in written}) == 6, [p.name for p in written]
+    assert all(p.is_file() for p in written)
+
+
+# ---------------------------------------------------------------------------
+# Deciding whether a page is maths, without asking
+# ---------------------------------------------------------------------------
+
+_ARTICLE = """<html><head><title>The alpha release</title></head><body><article>
+<p>The \u03b1-version shipped in March, and the \u03b2 followed in May. Costs rose
+\u224815% year over year \u2192 margins fell. The \u03a3 of small decisions is a culture,
+and the \u03c0-day tradition started as a joke. Temperatures above 30\u00b0C are now
+normal; \u0394 from the 1990s is stark. He wrote in \u03a9 magazine about the \u221e
+possibilities of the format, which is a long paragraph so that the extractor
+treats this as an article body rather than boilerplate to be discarded.</p>
+<p>A second paragraph, also of reasonable length, discussing the \u22642\u00d7 spread
+in prices and the way teams talk about \u03b1 testing without meaning anything
+mathematical by it at all. This should read exactly as written.</p>
+</article></body></html>"""
+
+_MATHS = """<html><head><title>On zeta</title></head><body><article>
+<p>Let <span class="katex"><span class="katex-mathml"><math><semantics>
+<annotation encoding="application/x-tex">\\alpha</annotation></semantics></math>
+</span></span> be a root. Then the sum over \u03b1 and \u03b2 converges, and we write
+\u2248 for asymptotic equality throughout this fairly long paragraph so that the
+extractor keeps it as the article body rather than discarding it as chrome.</p>
+<p>A second paragraph of similar length, in which \u221e appears and the \u2264 sign is
+used in the ordinary mathematical way, so the Unicode pass has something to
+do here and is right to do it.</p>
+</article></body></html>"""
+
+
+def test_prose_is_not_turned_into_latex():
+    """The Unicode pass wraps isolated Greek letters and symbols in $…$,
+    which is right where \u03b1 is a variable and wrong everywhere else. Measured
+    on eight ordinary sentences before it was gated, seven came back
+    rewritten — "The $\\alpha$-version shipped in March", "Costs rose
+    $\\approx$15%" — and a general read-later queue is mostly those."""
+    _, body = app._extract_url_content(_ARTICLE, "https://example.test/x")
+    assert body.strip(), "the fixture must extract as an article"
+    assert "$" not in body, body[:200]
+    assert "\u03b1-version" in body and "\u224815%" in body      # left exactly as written
+
+
+def test_a_page_that_ships_math_still_gets_it():
+    """The page's own markup is the signal: prose does not carry KaTeX."""
+    _, body = app._extract_url_content(_MATHS, "https://example.test/x")
+    assert "$\\alpha$" in body                      # the structural one
+    assert "$\\beta$" in body and "$\\approx$" in body   # and the Unicode pass ran
+
+
+def test_the_math_count_is_what_decides():
+    """Counted, not guessed — and every strategy replaces through one place,
+    so one added later cannot forget to be counted."""
+    from bs4 import BeautifulSoup
+    plain = BeautifulSoup("<p>An \u03b1-version and a \u03b2 test.</p>", "html.parser")
+    assert app._replace_math_elements(plain) == 0
+    katex = BeautifulSoup(
+        '<p><span class="katex"><span class="katex-mathml"><math><semantics>'
+        '<annotation encoding="application/x-tex">x^2</annotation>'
+        "</semantics></math></span></span></p>", "html.parser")
+    assert app._replace_math_elements(katex) == 1
+    source = Path(app.__file__).read_text()
+    body = source[source.index("def _replace_math_elements("):]
+    body = body[:body.index("\n\n\ndef ")]
+    # One call, inside the helper that counts.
+    assert body.count("replace_with(_math_replacement") == 1
+    assert body.count("swap(") == 9                  # the def plus eight uses
+
+
+def test_the_reader_loads_mathjax_only_where_there_is_math(tmp_path, monkeypatch):
+    """A megabyte of JavaScript from a CDN is a strange thing to fetch for an
+    article about tooling, and most of a read-later queue is that."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-prose.md").write_text(
+        '---\ntitle: "Prose"\n---\n\nNo formulas here, only words.\n',
+        encoding="utf-8")
+    (tmp_path / "2026-07-19-maths.md").write_text(
+        '---\ntitle: "Maths"\n---\n\nAll zeros have real part $1/2$.\n',
+        encoding="utf-8")
+    client = TestClient(app.app)
+    prose = client.get("/read/2026-07-19-prose.md").text
+    maths = client.get("/read/2026-07-19-maths.md").text
+    assert "mathjax" not in prose.lower(), "MathJax fetched for a page with no math"
+    assert "mathjax" in maths.lower()

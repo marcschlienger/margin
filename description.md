@@ -377,6 +377,45 @@ patterns are merged into `$X_{n}$`.
 
 ---
 
+## Deciding whether a page is maths
+
+Margin is a general read-later service that happens to be very good at maths,
+which means most of what it saves has no maths in it at all. Two of its steps
+are only right on a maths page, and one of them was actively wrong everywhere
+else.
+
+The math strategies in `_replace_math_elements` — MathML, MathJax 2 and 3,
+KaTeX, MediaWiki spans, `alt`-text formula images — are safe to run on
+anything: they only fire when the page ships that markup, and prose does not.
+The Unicode pass is different. It wraps isolated Greek letters and symbols in
+`$…$`, which is right where α is a variable and wrong where it is a product
+name. Measured on eight ordinary sentences, seven came back rewritten:
+
+    The α-version shipped in March  →  The $\alpha$-version shipped in March
+    Costs rose ≈15% year over year  →  Costs rose $\approx$15% year over year
+    The Σ of small decisions        →  The $\Sigma$ of small decisions
+
+So the page decides, and it decides with something it actually said rather
+than with a guess about its prose: `_replace_math_elements` returns how many
+elements it replaced, and the Unicode pass runs only when that count is
+non-zero. Every strategy replaces through one `swap()` helper, so a strategy
+added later cannot forget to be counted.
+
+What this gives up is a maths post written in plain Unicode with no markup —
+a blog saying "let α be a root" in a bare `<p>`. That case is rare, the text
+still reads correctly as Unicode, and it is genuinely indistinguishable from
+"the α-version shipped" without reading the article. If it ever matters, the
+escape hatch is a parameter on the save rather than a checkbox to consider on
+every one.
+
+The same signal makes the reader honest: it loads MathJax only for documents
+that contain `$…$`. It used to fetch a megabyte of JavaScript from a CDN for
+every Markdown page, including articles about tooling — which is also why the
+browser suite's runtime halved once this landed.
+
+Mathpix output is unaffected either way: the PDF path emits `$…$` directly,
+so the gate concerns only the HTML pipeline.
+
 ## Content Extraction
 
 After the math pre-processing pass, the modified HTML is passed to
@@ -409,6 +448,38 @@ timeout, plain-text credentials inside the shortcut) and only worth building
 if you cannot run the server.
 
 ---
+
+## Staying responsive, and staying inside the caps
+
+Two things a personal server gets wrong quietly, because with one user
+nothing visibly breaks until the day it does.
+
+**A save must not freeze the server.** Pandoc is `subprocess.run` with a
+thirty-second timeout and Margin asks for `.tex` and `.org`, so writing a
+save held the event loop for as long as Pandoc took. Measured with a stubbed
+three-second Pandoc: the loop ran 4 ticks where it should have run about 64 —
+no `/health`, no queue, no second save, for the duration. The write phase runs
+on a worker thread now (63 of 64 ticks in the same measurement). One lock
+covers choosing a stem and writing the files under it, because choosing looks
+at what exists and writing creates it: two saves that landed on the same title
+could otherwise pick the same stem, and moving the write off the loop is what
+made that window real.
+
+**A cap has to bound what is allocated, not what arrives.** `httpx`'s
+`aiter_bytes` hands over what the decoder produced, so a limit counted there
+is a limit on bytes that already exist — and how many that is belongs to
+whoever compressed them. Measured against 300 MB of zeros in 299 kB of gzip:
+a 10 MB cap peaked at 142.9 MiB. The wire is read raw and capped there, and a
+content coding is expanded with `zlib`'s own output limit, which puts the same
+case at 21.2 MiB — twice the cap, and proportional to it rather than to the
+compression ratio. Codings are still accepted, because refusing them would
+send a real PDF URL down the render path and produce a picture of a PDF
+viewer.
+
+Extraction and the reader's Markdown rendering stay on the loop: measured,
+`trafilatura` on a 413 kB page costs 0.22s and rendering a 160 kB saved
+document costs 0.48s. That is an order of magnitude below the Pandoc case and
+not worth the machinery.
 
 ## Offline reading
 

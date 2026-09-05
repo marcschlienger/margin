@@ -35,9 +35,11 @@ import sys
 import time
 import traceback
 import unicodedata
+import zlib
 import uuid
 import secrets
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from datetime import date
 from html import escape as _html_escape
@@ -604,6 +606,13 @@ def _write_text_atomically(path: Path, text: str) -> None:
     _write_bytes_atomically(path, _clean_text(text).encode("utf-8"))
 
 
+# Held across choosing a stem and writing the files under it. Choosing looks
+# at what exists and writing creates it, so two saves that landed on the same
+# title used to be able to pick the same stem — and once the writing moved off
+# the event loop (below) they could interleave inside the allocator itself.
+_WRITE_LOCK = threading.Lock()
+
+
 def _family_path(path: Path, formats: tuple[str, ...], reuse_stem: bool = False) -> Path:
     """Pick one stem that is free for the whole requested file family.
 
@@ -633,6 +642,14 @@ def _write_all_formats(filename: str, md_content: str, title: str,
     Returns the files actually written — Pandoc-derived ones are skipped
     silently when Pandoc is unavailable, exactly as before.
     """
+    with _WRITE_LOCK:
+        return _write_all_formats_locked(filename, md_content, title,
+                                         formats, reuse_stem)
+
+
+def _write_all_formats_locked(filename: str, md_content: str, title: str,
+                              formats: tuple[str, ...],
+                              reuse_stem: bool) -> list[Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     md_content = _clean_text(md_content)
     md_path = _family_path(OUTPUT_DIR / filename, formats, reuse_stem)
@@ -803,8 +820,13 @@ def _mathml_to_latex(node) -> str:
     return render_all()
 
 
-def _replace_math_elements(soup: BeautifulSoup) -> None:
+def _replace_math_elements(soup: BeautifulSoup) -> int:
     """Mutate soup in-place: replace every math element with $...$ / $$...$$ text.
+
+    Returns how many elements were replaced. That count is the page saying
+    what it is: prose does not ship MathML, KaTeX or MathJax, so a non-zero
+    answer means a maths page with no guessing involved. Extraction uses it
+    to decide whether the Unicode pass — which *is* a guess — runs at all.
 
     Strategies in priority order:
       1.  Wikipedia / MediaWiki  — <span class="mwe-math-element[-inline|-block]">
@@ -815,6 +837,15 @@ def _replace_math_elements(soup: BeautifulSoup) -> None:
       4.  MathJax 2              — <script type="math/tex[; mode=display]">
       5.  Image math             — <img alt="LATEX"> (SVG/PNG rendered formulas)
     """
+    found = 0
+
+    # Every strategy replaces through here, so one added later cannot forget
+    # to be counted.
+    def swap(node, latex, display):
+        nonlocal found
+        found += 1
+        node.replace_with(_math_replacement(latex, display))
+
     # 1. Wikipedia mwe-math-element spans
     for span in soup.find_all("span", class_="mwe-math-element"):
         ann = span.find("annotation", attrs={"encoding": "application/x-tex"})
@@ -822,7 +853,7 @@ def _replace_math_elements(soup: BeautifulSoup) -> None:
             continue
         classes = " ".join(span.get("class", []))
         display = "block" in classes and "inline" not in classes
-        span.replace_with(_math_replacement(ann.get_text(), display))
+        swap(span, ann.get_text(), display)
 
     # 1b. MathJax 3 rendered output. After client-side typesetting the TeX
     # source is gone from the DOM text; recover it from the assistive-MathML
@@ -841,7 +872,7 @@ def _replace_math_elements(soup: BeautifulSoup) -> None:
                 else (math.get("alttext") or _mathml_to_latex(math))
             )
         if latex.strip():
-            container.replace_with(_math_replacement(latex, display))
+            swap(container, latex, display)
         else:
             container.decompose()
 
@@ -851,26 +882,26 @@ def _replace_math_elements(soup: BeautifulSoup) -> None:
         display = math.get("display") == "block"
         ann = math.find("annotation", attrs={"encoding": "application/x-tex"})
         if ann:
-            math.replace_with(_math_replacement(ann.get_text(), display))
+            swap(math, ann.get_text(), display)
         elif math.get("alttext"):
-            math.replace_with(_math_replacement(math["alttext"], display))
+            swap(math, math["alttext"], display)
         else:
             latex = _mathml_to_latex(math)
             if latex.strip():
-                math.replace_with(_math_replacement(latex, display))
+                swap(math, latex, display)
 
     # 3. KaTeX rendered spans  (.katex wraps both inline and display)
     for katex in soup.find_all(class_="katex"):
         ann = katex.find("annotation", attrs={"encoding": "application/x-tex"})
         if ann:
             display = bool(katex.find_parent(class_="katex-display"))
-            katex.replace_with(_math_replacement(ann.get_text(), display))
+            swap(katex, ann.get_text(), display)
 
     # 4. MathJax 2 script tags — type is "math/tex", optionally with a
     # "; mode=display" suffix (spacing around ";" varies between sites).
     for tag in soup.find_all("script", attrs={"type": re.compile(r"^\s*math/tex")}):
         display = "display" in tag.get("type", "")
-        tag.replace_with(_math_replacement(tag.string or "", display))
+        swap(tag, tag.string or "", display)
 
     # 5. Image-rendered math: <img alt="LATEX ..."> (e.g. SVG formula images).
     for img in soup.find_all("img"):
@@ -880,11 +911,13 @@ def _replace_math_elements(soup: BeautifulSoup) -> None:
         parent = img.parent
         sole = len([s for s in parent.children if str(s).strip()]) == 1
         display = sole and parent.name in ("p", "div", "figure", "td", "li")
-        img.replace_with(_math_replacement(alt, display))
+        swap(img, alt, display)
 
     # Remove any leftover rendered MathJax output nodes (duplicates)
     for node in soup.find_all(True, class_=re.compile(r"MathJax|mjx-", re.I)):
         node.decompose()
+
+    return found
 
 
 def _is_footnote_marker(tag) -> bool:
@@ -987,7 +1020,9 @@ def _extract_url_content(html: str, url: str) -> tuple[str, str]:
     )
     title = _clean_title(raw_title)
 
-    _replace_math_elements(soup)
+    # The page's own answer to "is this maths": prose does not ship MathML,
+    # KaTeX or MathJax.
+    math_found = _replace_math_elements(soup)
     _preserve_sub_sup(soup)
 
     body = trafilatura.extract(
@@ -1000,7 +1035,15 @@ def _extract_url_content(html: str, url: str) -> tuple[str, str]:
 
     body = _RE_BLOCK.sub(r"\n$$\n\1\n$$\n", body)
     body = _RE_INLINE.sub(r"$\1$", body)
-    body = _apply_unicode_latex(body)
+    # Only on a page that already showed real math. The Unicode pass wraps
+    # isolated Greek letters and symbols in $…$, which is right in a paper
+    # where α is a variable and wrong everywhere else: measured on eight
+    # ordinary sentences, seven came back rewritten — "The $\alpha$-version
+    # shipped in March", "Costs rose $\approx$15%". A general read-later
+    # queue is mostly those. What is lost is a maths post written in plain
+    # Unicode with no markup, which is rare and still reads correctly.
+    if math_found:
+        body = _apply_unicode_latex(body)
     body = _escape_math_special(body)
 
     return title, body
@@ -1328,6 +1371,25 @@ def _looks_like_pdf(data: bytes) -> bool:
     return b"%PDF-" in data[:1024]
 
 
+def _inflate(data: bytes, encoding: str, limit: int) -> bytes | None:
+    """At most `limit` bytes of `data` decompressed, or None if we cannot.
+
+    zlib's decompress() takes a maximum length, which is the difference
+    between bounding the output and hoping it is small. Anything we did not
+    ask for — brotli, zstd — is simply not read.
+    """
+    windows = {"gzip": (16 + zlib.MAX_WBITS,), "x-gzip": (16 + zlib.MAX_WBITS,),
+               "deflate": (zlib.MAX_WBITS, -zlib.MAX_WBITS)}.get(encoding)
+    if windows is None:
+        return None
+    for wbits in windows:                 # "deflate" is raw as often as not
+        try:
+            return zlib.decompressobj(wbits).decompress(data, limit)
+        except zlib.error:
+            continue
+    return None
+
+
 async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
     """Return the raw bytes if `url` serves a PDF directly, else None."""
     ctype = ""
@@ -1339,12 +1401,22 @@ async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
     if "application/pdf" not in ctype and not urlparse(url).path.lower().endswith(".pdf"):
         return None
     try:
-        async with client.stream("GET", url) as resp:
+        # A PDF is already compressed, so a content coding on top of one buys
+        # nothing — but servers send them anyway, and httpx's aiter_bytes
+        # hands over what the decoder produced. A cap counted there is a cap
+        # on bytes that already exist, and how many that is belongs to whoever
+        # compressed them: measured against a 300 MB body in 299 kB of gzip,
+        # a 10 MB cap peaked at 142.9 MiB. Reading the wire raw and expanding
+        # under a bound puts the same case at 21.2 MiB — twice the cap, and
+        # proportional to it rather than to the compression ratio.
+        async with client.stream(
+                "GET", url,
+                headers={"Accept-Encoding": "identity, gzip, deflate"}) as resp:
             resp.raise_for_status()
             if "application/pdf" not in resp.headers.get("content-type", "").lower():
                 return None
             chunks, size = [], 0
-            async for chunk in resp.aiter_bytes():
+            async for chunk in resp.aiter_raw():
                 size += len(chunk)
                 if size > MAX_DOWNLOAD_BYTES:
                     raise RuntimeError(
@@ -1352,15 +1424,26 @@ async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
                     )
                 chunks.append(chunk)
             data = b"".join(chunks)
-            return data if _looks_like_pdf(data) else None
+            encoding = resp.headers.get("content-encoding", "").strip().lower()
+        if encoding and encoding != "identity":
+            data = _inflate(data, encoding, MAX_DOWNLOAD_BYTES + 1)
+            if data is None:
+                return None                 # a coding we did not ask for
+            if len(data) > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(
+                    f"PDF at {url} exceeds {MAX_DOWNLOAD_BYTES // 2**20} MB"
+                )
+        return data if _looks_like_pdf(data) else None
     except httpx.HTTPError:
         return None
 
 
 def _write_binary(filename: str, data: bytes) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _family_path(OUTPUT_DIR / filename, (Path(filename).suffix.lstrip("."),))
-    _write_bytes_atomically(path, data)
+    with _WRITE_LOCK:
+        path = _family_path(OUTPUT_DIR / filename,
+                            (Path(filename).suffix.lstrip("."),))
+        _write_bytes_atomically(path, data)
     return path
 
 
@@ -1620,8 +1703,14 @@ async def _run_markdown_save(
     md = _frontmatter(title, url, has_math="$" in body) + "\n" + body
     try:
         filename = f"{preferred_stem}.md" if preferred_stem else _filename(title)
-        written = _write_all_formats(
-            filename, md, title, formats, reuse_stem=preferred_stem is not None
+        # Off the loop: Pandoc is subprocess.run(timeout=30) and Margin asks
+        # for .tex and .org, so a save froze the whole server for as long as
+        # it took — measured, a 3.0s write let the loop run 4 ticks where it
+        # should have run about 64, so /health, the queue and every other
+        # save waited it out.
+        written = await asyncio.to_thread(
+            _write_all_formats,
+            filename, md, title, formats, preferred_stem is not None
         )
     except Exception as e:
         _log("save-url", f"write failed: {e}\n{traceback.format_exc()}")
@@ -1705,9 +1794,10 @@ async def save(payload: SavePayload, request: Request):
             try:
                 mmd = await _mathpix_pdf(pdf_bytes)
                 md = _frontmatter(title, payload.url, has_math="$" in mmd) + "\n" + mmd
-                written = _write_all_formats(
-                    f"{stem}.md" if stem else _filename(title), md, title, md_formats,
-                    reuse_stem=stem is not None,
+                written = await asyncio.to_thread(
+                    _write_all_formats,
+                    f"{stem}.md" if stem else _filename(title), md, title,
+                    md_formats, stem is not None,
                 )
                 saved.extend(p.name for p in written)
                 if written and stem is None:
@@ -1820,9 +1910,10 @@ async def save_pdf(file: UploadFile = File(...)):
     if mmd is not None:
         md = _frontmatter(title, has_math="$" in mmd) + "\n" + mmd
         try:
-            written = _write_all_formats(
+            written = await asyncio.to_thread(
+                _write_all_formats,
                 f"{stem}.md" if stem else _filename(title), md, title,
-                _DEFAULT_MD_FORMATS, reuse_stem=stem is not None,
+                _DEFAULT_MD_FORMATS, stem is not None,
             )
             saved.extend(p.name for p in written)
         except Exception as e:
@@ -2556,7 +2647,11 @@ async def read_file(name: str):
         body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
         if ext == ".md" and _markdown is not None:
             content = _render_markdown(body)
-            mathjax = _MATHJAX_SNIPPET
+            # Only where there is something to typeset. A megabyte of
+            # JavaScript from a CDN is a strange thing to fetch for an
+            # article about tooling, and most of a read-later queue is that.
+            if _RE_MATH_SPAN.search(body):
+                mathjax = _MATHJAX_SNIPPET
         else:
             content = f"<pre>{_html_escape(body)}</pre>"
         is_text = "true"

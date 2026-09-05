@@ -39,6 +39,12 @@ collect the results in a synced folder (iCloud → Obsidian, Nextcloud, Syncthin
                     (e.g. an iCloud/Nextcloud folder synced to your notes app)
 ```
 
+Maths is detected from the page, not from a setting: the Markdown path
+converts whatever formula markup a page ships (MathJax, KaTeX, MathML,
+MediaWiki, `alt`-text images), and only pages that ship some get the extra
+pass that turns stray Unicode symbols into LaTeX. An article about the
+α-version keeps its α.
+
 The PDF path is the general-purpose one: it works on any page, including
 client-side-rendered SPAs, and preserves exactly what a browser shows. The
 Markdown path is the "clean text for my notes app" one: it extracts the
