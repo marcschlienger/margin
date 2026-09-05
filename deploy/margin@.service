@@ -18,6 +18,10 @@ RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+# A saved page is something someone chose to keep. Without this the files
+# inherit the host's umask, which on most systems is world-readable — and
+# the directory being 0700 is then the only thing standing in the way.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

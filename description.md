@@ -121,7 +121,7 @@ path shares so a save yields the same files however it was triggered.
 Either branch yields the same requested formats, so a save is consistent
 regardless of whether the URL was a page or a PDF.
 
-**Returns:** `{ "status": "ok", "title": "...", "files": [...], "path": "..." }`,
+**Returns:** `{ "status": "ok", "title": "...", "files": [...] }`,
 or `{ "status": "error", "message": "..." }` — always HTTP 200.
 
 ---
@@ -408,6 +408,60 @@ if you cannot run the server.
 
 ---
 
+## What the client is not told, and what it may do
+
+- **The output directory's path stays server-side.** `/health` is public — it
+  has to be, for a probe that carries no credentials — and on a real install
+  the path names the account the service runs as. It reports whether the
+  folder exists and is writable, which is the useful half.
+- **A page you are visiting may not change anything.** CORS does not help:
+  a plain HTML form posts cross-origin without a preflight, and the browser
+  sends it whether or not the answer can be read. With `MARGIN_TOKEN` unset —
+  the documented private-network default — any page could archive, restore or
+  delete a saved item; verified against a running instance before the guard
+  existed. Requests that change something are refused when the browser marks
+  them `Sec-Fetch-Site: cross-site`. Browsers send that header and nothing
+  else does, so `curl`, the Shortcut and RSS readers are unaffected, and GET
+  stays open because the bookmarklet is a cross-site navigation by design.
+  Cross-origin *reading* is opt-in through `MARGIN_CORS_ORIGINS`; the
+  wildcard that used to be the default let any page read the answers.
+- **A saved file is a file inside the folder.** `/files` and `/read` resolve
+  a name only within the output directory or its `archive/`, symlinks
+  resolved — the folder is synced and written to by other software, so a name
+  in it can be a link to anything the account can read.
+- **A recorded source is a link only if we would follow it.** Front matter
+  comes out of that same folder, so `source_url` is rendered as a link only
+  when its scheme is http, https or mailto, and off-site links open off-site
+  (`target=_blank`, `rel=noopener noreferrer`) rather than replacing the queue.
+- **An error is a page a browser can get out of.** A stale bookmark or a file
+  moved in the synced folder is ordinary, and a bare JSON body leaves the
+  reader with no way back — on the home screen there is not even a back
+  button. Clients that asked for JSON still get JSON.
+
+## The look, and why it is shared
+
+Margin and Footnote are siblings and are meant to look it: one palette (cream
+paper, slate ink, a red rule, blue for the app's own marks), one serif for
+anything you read and one sans for anything you operate. `static/style.css`
+holds it, the `:root` block is the shared part, and the two files are meant to
+stay diffable — the pages used to carry three separate `<style>` blocks that
+had drifted from each other and from Footnote entirely.
+
+Two details are worth naming because they were wrong for a while. The header
+icon is sized to the h1's line box and set flush with its top: centred
+against the whole two-line block it lined up with the gap between the title
+and the tagline and with neither line. And the queue's dates are written as
+ISO stamps in `<time datetime=…>`, so they are still right with no script,
+and rendered in the reader's own locale order by a few lines that read the
+attribute back.
+
+The reader's Copy button is offered whenever the file is text, not only where
+`navigator.clipboard` exists. The Clipboard API is a secure-context feature
+and Margin is normally reached over plain HTTP on a home network, so the old
+condition hid the button exactly where it was needed; the deprecated
+selection route is the fallback, and a refusal says so rather than looking
+like a button that does nothing.
+
 ## Dependencies
 
 | Package | Purpose |
@@ -440,7 +494,7 @@ journalctl -u margin@<user> -f   # logs
 
 **macOS — Launch Agent (auto-starts at login):**
 ```bash
-launchctl load ~/Library/LaunchAgents/com.marc.math-readlater.plist
+launchctl load ~/Library/LaunchAgents/<label>.plist
 tail -f server.log               # logs, in the app directory
 ```
 

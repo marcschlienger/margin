@@ -104,8 +104,8 @@ existed.
 
 ```json
 { "status": "ok", "title": "Fourier transform",
-  "files": ["2026-07-18-fourier-transform.pdf", "2026-07-18-fourier-transform.md"],
-  "path": "/var/lib/margin/inbox" }
+  "files": ["2026-07-18-fourier-transform.pdf",
+            "2026-07-18-fourier-transform.md"] }
 ```
 
 On partial success a `"warnings"` array lists what failed; on total failure
@@ -225,6 +225,8 @@ Debug helper: echoes method, headers, and parsed body of the request back.
 | Default formats | `DEFAULT_FORMATS` in `.env` (subset of `pdf,md,tex,org`) | `pdf,md,tex` |
 | Mathpix credentials | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` in `.env` | unset — `/save-pdf` disabled |
 | API token | `MARGIN_TOKEN` in `.env` | unset — no authentication |
+| Cross-origin access | `MARGIN_CORS_ORIGINS` in `.env` (comma-separated origins) | unset — no cross-origin access |
+| Saves to private addresses | `MARGIN_ALLOW_PRIVATE_URLS` in `.env` | unset — loopback, LAN and metadata addresses refused |
 
 ## Authentication (optional)
 
@@ -257,7 +259,27 @@ javascript:window.open('http://YOUR-SERVER:8000/save-page?token=YOUR-TOKEN&url='
 
 `GET /health` stays open (it reports `"auth_required": true` so clients can
 detect the requirement) and CORS preflights pass through, as they carry no
-credentials.
+credentials. It does **not** report where the output directory is: the path
+names the account the service runs as, and whether the folder works is the
+useful half.
+
+**Margin will not fetch its own network.** It saves whatever URL it is given
+and then serves the result back through `/read`, so an address inside the
+machine — loopback, `10.x`, `192.168.x`, link-local, cloud metadata — would
+be a way to read those services *through* Margin, and with no token that is
+open to anyone who can reach the port. Such addresses are refused, including
+the shorthands a resolver accepts (`127.1`, `2130706433`, `0x7f000001`) and
+names that IDNA folds onto them. Set `MARGIN_ALLOW_PRIVATE_URLS=1` if you
+save from an internal wiki and want it back.
+
+**A page you are visiting cannot change anything here.** A plain HTML form
+posts cross-origin without a preflight and the browser sends it whether or
+not the answer can be read, so with `MARGIN_TOKEN` unset — the private-network
+default — any site could have archived, restored or deleted your saved items.
+Requests that change something are refused when the browser marks them
+cross-site (`Sec-Fetch-Site: cross-site`). `curl`, the iOS Shortcut and RSS
+readers send no such header and are unaffected, and `GET` stays open because
+the bookmarklet's whole job is a cross-site navigation to `/save-page`.
 
 ## Remote access via Tailscale
 
@@ -302,11 +324,11 @@ special-casing, no port forwarding, no dynamic DNS.
 
   ```bash
   # in /etc/margin/<user>.env: HOST=127.0.0.1
-  sudo systemctl daemon-reload && sudo systemctl restart margin
+  sudo systemctl daemon-reload && sudo systemctl restart margin@<user>
   sudo tailscale serve --bg 8000
   ```
 
-  Margin is now at `https://margin-box.<your-tailnet>.ts.net` (no port, note
+  Margin is now at `https://<machine>.<your-tailnet>.ts.net` (no port, note
   the **https**) and unreachable from the LAN or anywhere outside the
   tailnet. The HTTPS URL has a bonus: browsers no longer treat the server as
   mixed content, so `fetch()`-based clients and extensions work from https
@@ -318,7 +340,8 @@ changes.
 
 ## Install
 
-Requirements: Python ≥ 3.10. Optional: `pandoc` (for `.tex`/`.org`
+Requirements: Python ≥ 3.10 (the installer refuses anything older rather
+than starting a service that fails inside a save). Optional: `pandoc` (for `.tex`/`.org`
 companions), Mathpix credentials (for `/save-pdf`).
 
 ### Local / macOS
@@ -348,9 +371,9 @@ into that person's own (synced) folder, and has its own port, token, reading
 queue, and duplicate index. From a checkout on the server:
 
 ```bash
-sudo bash deploy/install.sh                    # shared platform (once)
-sudo bash deploy/add-instance.sh marc 8000     # one line per person
-sudo bash deploy/add-instance.sh anna 8001
+sudo bash deploy/install.sh                       # shared platform (once)
+sudo bash deploy/add-instance.sh <user> 8000     # one line per person
+sudo bash deploy/add-instance.sh <other-user> 8001
 ```
 
 `install.sh` sets up the shared parts — code and venv in `/opt/margin`,
@@ -359,14 +382,36 @@ systemd template. `add-instance.sh <user> <port> [output-dir]` writes
 `/etc/margin/<user>.env` (output dir defaults to
 `/home/<user>/ReadLater/inbox`; a `MARGIN_TOKEN` is generated and printed),
 installs headless Chromium into that user's cache, and enables
-`margin@<user>`. Both are idempotent.
+`margin@<user>`. Both are idempotent, and both refuse a destination that is
+not theirs: `/`, a top-level system directory, or a populated directory that
+is not a Margin installation. Both run as root and turn a path into the
+target of `chown`, a recursive `chmod` and — for the application directory —
+`rsync --delete`, so a mistyped one is not a misconfiguration to correct on
+the next run. `add-instance.sh` also stops rather than guessing when an
+existing `/etc/margin/<user>.env` does not say what the instance runs as:
+systemd reads that file, not the command line.
+
+Saved pages are private by default: the output directory is created `0700`
+and the unit runs with `UMask=0077`. The shared `/opt/margin/.env` is `0640`
+and readable through a `margin` group each instance user joins, rather than
+by every local account.
+
+Versions are lower bounds in `requirements.txt`, so an install resolves them
+afresh and two installs a month apart are not the same software. Generate
+`deploy/constraints.txt` on the server, test it, commit it, and every later
+install gets exactly those versions:
+
+```bash
+bash deploy/make-constraints.sh python3   # on the server, not on a laptop
+.venv/bin/python -m pytest
+```
 
 Day-2 operations:
 
 ```bash
-systemctl status margin@marc
-journalctl -u margin@marc -f
-sudoedit /etc/margin/marc.env && sudo systemctl restart margin@marc
+systemctl status margin@<user>
+journalctl -u margin@<user> -f
+sudoedit /etc/margin/<user>.env && sudo systemctl restart margin@<user>
 sudo bash deploy/install.sh && sudo systemctl restart 'margin@*'   # upgrade
 ```
 
@@ -404,8 +449,10 @@ Tailscale, WireGuard) and/or use the per-instance `MARGIN_TOKEN` — see
   the quoted URL to also get Markdown. (The bookmarklet navigates instead of
   using `fetch()` because browsers block mixed-content requests from https
   pages to a plain-http LAN server; opening a tab is always allowed. The
-  server also sends permissive CORS headers, so extension-based or
-  `fetch`-based clients work too wherever mixed content isn't an issue.)
+  Cross-origin `fetch` clients — a browser extension of your own — need
+  their origin named in `MARGIN_CORS_ORIGINS`; a wildcard used to be the
+  default, which let any page you happened to be visiting read this
+  instance's answers.)
 - **The built-in queue page** — open `http://YOUR-SERVER:8000/` in any
   browser: paste a URL to save, read via the file links, archive when done.
   On iPhone/iPad, Safari's Share → **Add to Home Screen** installs it as a

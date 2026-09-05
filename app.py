@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import traceback
@@ -47,6 +49,7 @@ from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -127,16 +130,22 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="Margin", version="2.1.0", lifespan=lifespan)
 
-# Allow cross-origin calls (browser extensions, fetch-based clients). Origins
-# are not restricted — the server is either on a private network or protected
-# by MARGIN_TOKEN; the auth cookie is SameSite=Strict and never sent
-# cross-origin.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Cross-origin access is opt-in. A wildcard let any page you happen to be
+# visiting read this instance's answers, and with MARGIN_TOKEN unset — the
+# documented private-network default — that is every page on the web. Name
+# the origins that need it, comma-separated, in MARGIN_CORS_ORIGINS; a
+# browser extension or a fetch-based client of your own is what this is for.
+MARGIN_CORS_ORIGINS = [o for o in re.split(r"[\s,]+",
+                                           os.getenv("MARGIN_CORS_ORIGINS", ""))
+                       if o]
+if MARGIN_CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=MARGIN_CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +200,67 @@ def _request_token(request: Request) -> str:
         return auth[7:].strip()
     return (request.query_params.get("token")
             or request.cookies.get(_TOKEN_COOKIE, ""))
+
+
+# The multipart framing around a PDF upload, so a file exactly at the cap
+# still fits. Anything past this is refused before a byte is stored.
+MAX_BODY_BYTES = MAX_PDF_BYTES + 1024 * 1024
+
+
+@app.middleware("http")
+async def _limit_body(request: Request, call_next):
+    """Refuse an oversized body before the framework reads it.
+
+    Checking the size after reading is not a limit: Starlette parses the
+    whole multipart body before the handler runs, so a 200 MB upload was
+    spooled to disk in full and only then told it was too large — measured,
+    with the error quoting all 209,715,209 bytes. On an instance with no
+    token that is unauthenticated disk consumption.
+
+    Declared before the token check so it runs *inside* it: an oversized
+    request to a locked instance should be unauthorized rather than told its
+    body is too large.
+
+    Content-Length only. A chunked upload has none, and bounding that means
+    counting the stream by hand, which is more machinery than a personal
+    server on a private network needs — the handler's own check stays as the
+    backstop for that case.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return JSONResponse(
+            {"status": "error", "filename": "",
+             "message": f"Request body too large (max {MAX_BODY_BYTES} bytes)",
+             "summary": "Error: request body too large"},
+            status_code=413)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _refuse_cross_site_writes(request: Request, call_next):
+    """A page you happen to be visiting may not change anything here.
+
+    CORS does not help: a plain HTML form posts cross-origin without a
+    preflight, and the browser sends it whether or not the answer can be
+    read. With MARGIN_TOKEN unset — the documented private-network default —
+    any page could archive, restore or delete a saved item. Verified against
+    a running instance before this existed: `Origin: https://evil.test` on a
+    form POST to /archive moved the item and answered 303.
+
+    Sec-Fetch-Site is sent by browsers and by nothing else, so curl, the iOS
+    Shortcut and the RSS reader are unaffected. GET stays open because the
+    bookmarklet's whole job is a cross-site navigation to /save-page.
+    """
+    if (request.method not in ("GET", "HEAD", "OPTIONS")
+            and request.headers.get("sec-fetch-site") == "cross-site"):
+        return JSONResponse(
+            {"status": "error", "filename": "",
+             "message": "Refused: a cross-site request may not change "
+                        "anything here.",
+             "summary": "Error: cross-site request refused"},
+            status_code=403,
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -869,12 +939,97 @@ def _clean_shortcut_url(v: str) -> str:
     return joined
 
 
+# Addresses inside this machine or its network. Margin fetches whatever URL
+# it is handed and then serves the result back through /read and /files, so
+# without this a caller can read the server's own loopback services and its
+# cloud metadata and collect the answer — and with MARGIN_TOKEN unset, the
+# documented private-network default, that caller is anyone who can reach the
+# port. Verified before this existed: POST /save-url with
+# http://127.0.0.1:<port>/health saved the response into the output folder.
+#
+# Set MARGIN_ALLOW_PRIVATE_URLS=1 to turn it off — saving from an internal
+# wiki on the same network is a real thing to want, and an operator who wants
+# it should be able to say so.
+ALLOW_PRIVATE_URLS = os.getenv("MARGIN_ALLOW_PRIVATE_URLS", "").strip().lower() \
+    in ("1", "true", "yes", "on")
+
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$")
+
+
+def _ascii_host(url: str) -> str | None:
+    """The hostname as a resolver will see it, or None if there is not one.
+
+    One function, so the name that is *classified* is the name that will be
+    *resolved*: IDNA folds "127。0。0。1" onto loopback, so checking the
+    original and resolving the encoded form lets exactly that through.
+    """
+    text = str(url or "")
+    if text != re.sub(r"[\x00-\x20]", "", text):
+        return None                     # control characters inside the URL
+    try:
+        parsed = urlparse(text)
+        host = parsed.hostname
+        parsed.port                     # raises for an invalid port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)      # a literal address is a fine host
+        return host
+    except ValueError:
+        pass
+    try:
+        encoded = host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return None
+    return encoded if _HOSTNAME_RE.fullmatch(encoded) else None
+
+
+def _as_address(host: str):
+    """The address this host denotes, including the resolver's shorthands.
+
+    "127.1", "2130706433" and "0x7f000001" all reach 127.0.0.1 — inet_aton
+    accepts them and so does every resolver, while ipaddress alone does not.
+    """
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    try:
+        return ipaddress.ip_address(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None
+
+
+def is_public_http_url(url: str) -> bool:
+    """An http(s) URL that points at the open internet."""
+    host = (_ascii_host(url) or "").lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return False
+    address = _as_address(host)
+    if address is None:
+        return True                     # a name; the resolver decides
+    # is_global covers carrier-grade NAT (100.64/10), which is neither
+    # private nor reserved — but Python also calls multicast and IPv6
+    # site-local addresses global, so those are excluded by name.
+    return (address.is_global and not address.is_multicast
+            and not getattr(address, "is_site_local", False))
+
+
 def _validated_url(v: str) -> str:
     url = _clean_shortcut_url(v)
     scheme = urlparse(url).scheme.lower()
     # Only web URLs — keeps the fetcher/headless browser away from file:// etc.
     if scheme not in ("http", "https"):
         raise ValueError(f"Only http(s) URLs are supported, got: {url[:100]}")
+    if not ALLOW_PRIVATE_URLS and not is_public_http_url(url):
+        raise ValueError(
+            "That address is inside this machine or its network, and Margin "
+            "would fetch it and then serve the result back. Set "
+            "MARGIN_ALLOW_PRIVATE_URLS=1 if that is what you want.")
     return url
 
 
@@ -992,11 +1147,18 @@ def _url_index_path() -> Path:
 
 
 def _load_url_index() -> dict[str, list[str]]:
+    path = _url_index_path()
     try:
-        idx = json.loads(_url_index_path().read_text(encoding="utf-8"))
-        return idx if isinstance(idx, dict) else {}
-    except (OSError, ValueError):
+        idx = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:
+        # Duplicate detection quietly stops working when this happens, so it
+        # is worth one line rather than none.
+        _log("index", f"URL index unreadable ({e}); duplicates will not be "
+                      f"detected until the next save rewrites it")
+        return {}
+    return idx if isinstance(idx, dict) else {}
 
 
 def _record_url(url: str, stem: str) -> None:
@@ -1004,11 +1166,37 @@ def _record_url(url: str, stem: str) -> None:
     stems = idx.setdefault(_norm_url(url), [])
     if stem not in stems:
         stems.append(stem)
+    # Written atomically: this file lives in a folder a sync client watches,
+    # and write_text truncates before it writes. A crash or a mid-write read
+    # leaves a half file, which _load_url_index cannot parse — and it answers
+    # an unparsable index with an empty one, so every recorded URL is
+    # silently forgotten and every page looks new again.
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        _url_index_path().write_text(json.dumps(idx, indent=1), encoding="utf-8")
+        _write_json_atomically(_url_index_path(), idx)
     except OSError as e:
         _log("index", f"could not write URL index: {e}")
+
+
+def _write_json_atomically(path: Path, data) -> None:
+    """Write to a temp file in the same directory, then rename over the top.
+
+    rename(2) within a directory is atomic, so a reader sees either the old
+    file or the new one — never the half-written state a truncating write
+    leaves behind whenever it is interrupted.
+    """
+    tmp = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=str(path.parent),
+        prefix=f".{path.name}.", suffix=".tmp", delete=False)
+    try:
+        with tmp as fh:
+            json.dump(data, fh, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp.name, path)
+    except BaseException:
+        Path(tmp.name).unlink(missing_ok=True)
+        raise
 
 
 def _files_for_stems(stems: set[str]) -> list[Path]:
@@ -1054,7 +1242,6 @@ def _duplicate_response(existing: dict) -> dict:
         "title": existing["title"],
         "files": existing["files"],
         "filename": existing["files"][0],
-        "path": str(OUTPUT_DIR),
         "message": f"Already saved ({existing['files'][0]}) — "
                    'send "force": true to save again',
         "summary": f"Already saved: {existing['files'][0]}",
@@ -1179,7 +1366,6 @@ async def _run_markdown_save(
         "filename": written[0].name,
         "files": [p.name for p in written],
         "title": title,
-        "path": str(written[0]),
         "summary": f"Saved: {written[0].name}",
     }
 
@@ -1301,7 +1487,6 @@ async def save(payload: SavePayload, request: Request):
         "status": "ok",
         "title": title,
         "files": saved,
-        "path": str(OUTPUT_DIR),
         "summary": f"Saved: {', '.join(saved)}",
         **({"warnings": errors} if errors else {}),
     }
@@ -1316,6 +1501,9 @@ async def save_pdf(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         return _err("Expected a .pdf file")
 
+    # The backstop: _limit_body refuses anything that declares an oversized
+    # Content-Length, which is every ordinary client. A chunked upload
+    # declares nothing, and reaches here.
     pdf_bytes = await file.read()
     if len(pdf_bytes) > MAX_PDF_BYTES:
         return _err(f"PDF too large: {len(pdf_bytes)} bytes (max {MAX_PDF_BYTES})")
@@ -1371,7 +1559,6 @@ async def save_pdf(file: UploadFile = File(...)):
         "filename": saved[0],
         "files": saved,
         "title": title,
-        "path": str(OUTPUT_DIR),
         "summary": f"Saved: {', '.join(saved)}",
         **({"warnings": errors} if errors else {}),
     }
@@ -1386,10 +1573,13 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # SVG first for browsers that support it; 32px PNG fallback for Safari,
 # which ignores SVG favicons.
-_HEAD_ICONS = """<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+_HEAD = """<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="manifest" href="/manifest.json">"""
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#EDE2C9">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="stylesheet" href="/static/style.css">"""
 
 
 @app.get("/favicon.svg", include_in_schema=False)
@@ -1432,21 +1622,48 @@ async def manifest():
 # Result page for the /save-page bookmarklet flow. Doubled braces are literal
 # CSS braces (str.format).
 _SAVE_PAGE_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Margin</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-__HEAD_ICONS__
-<style>
-  body {{ font: 16px/1.5 -apple-system, system-ui, sans-serif;
-          max-width: 34rem; margin: 4rem auto; padding: 0 1rem; }}
-  h1 {{ font-size: 1.3rem; }}
-  .ok {{ color: #2e7d32; }} .err {{ color: #c62828; }}
-</style></head>
+<html lang="en"><head><meta charset="utf-8"><title>Margin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+__HEAD__
+</head>
 <body>
-<h1 class="{cls}">{heading}</h1>
-<p>{detail}</p>
-{autoclose}
-<p><a href="/">← Margin inbox</a></p>
+<main>
+  <div class="notice {cls}">
+    <h1>{heading}</h1>
+    <p class="detail">{detail}</p>
+  </div>
+  {autoclose}
+  <p><a href="/">← Margin</a></p>
+</main>
 </body></html>"""
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(request: Request, exc: StarletteHTTPException):
+    """An error a browser can get out of.
+
+    A stale bookmark, a file moved in the synced folder, a mistyped address —
+    all ordinary, and a bare JSON body leaves the reader on a page with no
+    way back. On the home screen there is not even a back button. Clients
+    that asked for JSON still get JSON.
+    """
+    wants_html = ("text/html" in request.headers.get("accept", "")
+                  and request.method == "GET")
+    if not wants_html:
+        return JSONResponse({"detail": exc.detail},
+                            status_code=exc.status_code,
+                            headers=getattr(exc, "headers", None))
+    detail = _html_escape(str(exc.detail or "Not here"))
+    return HTMLResponse(
+        _SAVE_PAGE_HTML.replace("__HEAD__", _HEAD).format(
+            cls="bad", heading=f"{exc.status_code} — not here",
+            detail=detail, autoclose=""),
+        status_code=exc.status_code)
+
+
+# Responses name files, never the folder they are in: the output directory's
+# path names the account the service runs as, and a client addresses a save by
+# its filename. The iOS Shortcut reads "summary"; nothing consumed "path".
 
 
 def _save_page_response(ok: bool, heading: str, detail: str) -> HTMLResponse:
@@ -1455,8 +1672,8 @@ def _save_page_response(ok: bool, heading: str, detail: str) -> HTMLResponse:
         "<script>setTimeout(function () { window.close(); }, 2500)</script>"
         if ok else ""
     )
-    return HTMLResponse(_SAVE_PAGE_HTML.replace("__HEAD_ICONS__", _HEAD_ICONS).format(
-        cls="ok" if ok else "err",
+    return HTMLResponse(_SAVE_PAGE_HTML.replace("__HEAD__", _HEAD).format(
+        cls="" if ok else "bad",
         heading=_html_escape(heading),
         detail=_html_escape(detail),
         autoclose=autoclose,
@@ -1506,64 +1723,35 @@ _RE_SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
 # Placeholders (__ROWS__ etc.) are substituted with str.replace, so the CSS
 # and JS braces below need no escaping.
 _INDEX_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Margin</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-__HEAD_ICONS__
-<style>
-  :root { color-scheme: light dark;
-          --muted: #8a8a8e; --line: #88888833; --btn: #88888818; }
-  body { font: 16px/1.55 -apple-system, system-ui, sans-serif;
-         max-width: 46rem; margin: 3rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.4rem; }
-  h1 a { color: inherit; text-decoration: none; }
-  form.saver { margin: 1rem 0 .8rem; }
-  form.saver .row { display: flex; gap: .6rem; align-items: center; }
-  form.saver input[type=url], #filter {
-    flex: 1; min-width: 14rem; font: inherit; padding: .45rem .6rem;
-    border: 1px solid var(--muted); border-radius: 6px;
-    background: transparent; color: inherit; }
-  details.formats { margin-top: .5rem; font-size: .85rem; }
-  details.formats summary { cursor: pointer; color: var(--muted); }
-  details.formats summary b { color: inherit; font-weight: 500; }
-  .fmt-list { display: flex; flex-direction: column; gap: .35rem;
-              margin: .6rem 0 .2rem .2rem; }
-  .fmt-list label { cursor: pointer; }
-  .fmt-list small { color: var(--muted); }
-  #filter { margin-bottom: 1rem; display: block; width: 100%;
-            box-sizing: border-box; }
-  .tabs { margin-bottom: .8rem; font-size: .95rem; }
-  .tabs a { margin-right: 1.2rem; }
-  .item { padding: .7rem 0; border-bottom: 1px solid var(--line);
-          display: flex; gap: 1rem; align-items: baseline; }
-  .date { color: var(--muted); font-size: .82rem; white-space: nowrap; }
-  .main { flex: 1; }
-  .main a.title { font-weight: 600; text-decoration: none; }
-  .links { font-size: .82rem; margin-top: .15rem; }
-  .links a { margin-right: .7rem; }
-  button { font: inherit; font-size: .82rem; padding: .25rem .7rem;
-           border: 1px solid var(--muted); border-radius: 6px;
-           background: var(--btn); color: inherit; cursor: pointer; }
-  button.danger { color: #c43d33; border-color: #c43d3366; }
-  .empty { color: var(--muted); margin-top: 2rem; }
-</style></head>
+<html lang="en"><head><meta charset="utf-8"><title>Margin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+__HEAD__
+</head>
 <body>
-<h1><a href="/">Margin</a></h1>
-<form class="saver" method="get" action="/save-page">
-  <div class="row">
-    <input type="url" name="url" placeholder="https://…  save a page" required>
-    <button type="submit">Save</button>
-  </div>
-  <details class="formats">
-    <summary>Formats: <b id="fmt-summary"></b></summary>
-    <div class="fmt-list">__FORMAT_CHECKBOXES__</div>
-  </details>
-</form>
-<div class="tabs">
-  <a href="/">Inbox (__INBOX_COUNT__)</a>
-  <a href="/?view=archive">Archive (__ARCHIVE_COUNT__)</a>
-</div>
-<input id="filter" type="search" placeholder="Filter by title…">
-__ROWS__
+<main>
+  <header class="masthead">
+    <img src="/favicon.svg" alt="" width="30" height="30">
+    <div>
+      <h1><a href="/">Margin</a></h1>
+      <p class="tagline">Save a page — read it later, in your own folder.</p>
+    </div>
+  </header>
+
+  <form class="saver" method="get" action="/save-page">
+    <div class="row">
+      <input type="url" name="url" placeholder="https://…  save a page" required>
+      <button type="submit">Save</button>
+    </div>
+    <details class="formats">
+      <summary>Formats: <b id="fmt-summary"></b></summary>
+      <div class="fmt-list">__FORMAT_CHECKBOXES__</div>
+    </details>
+  </form>
+
+  <div class="queue-head">__TABS__</div>
+  <input id="filter" type="search" placeholder="Filter by title…">
+  __ROWS__
+</main>
 <script>
 document.getElementById('filter').addEventListener('input', function () {
   const q = this.value.toLowerCase();
@@ -1572,12 +1760,23 @@ document.getElementById('filter').addEventListener('input', function () {
   });
 });
 
+// The date is written as an ISO stamp so it is still right without script;
+// this reads it back in whatever order the reader's locale puts it.
+document.querySelectorAll('time[datetime]').forEach(function (el) {
+  const when = new Date(el.getAttribute('datetime') + 'T12:00:00');
+  if (isNaN(when.getTime())) return;
+  const parts = { month: 'short', day: 'numeric' };
+  if (when.getFullYear() !== new Date().getFullYear()) parts.year = 'numeric';
+  el.textContent = when.toLocaleDateString([], parts);
+});
+
 // Format checkboxes: restore last choice, keep the summary line current.
 (function () {
   const NAMES = { pdf: 'PDF', md: 'Markdown', tex: 'LaTeX', org: 'Org' };
   const boxes = Array.from(
     document.querySelectorAll('.fmt-list input[type=checkbox]'));
-  const saved = localStorage.getItem('margin-formats');
+  let saved = null;
+  try { saved = localStorage.getItem('margin-formats'); } catch (e) { /* private mode */ }
   if (saved !== null) {
     const picked = saved.split(',');
     boxes.forEach(b => { b.checked = picked.includes(b.value); });
@@ -1586,7 +1785,8 @@ document.getElementById('filter').addEventListener('input', function () {
     const picked = boxes.filter(b => b.checked).map(b => b.value);
     document.getElementById('fmt-summary').textContent =
       picked.length ? picked.map(v => NAMES[v]).join(', ') : 'none';
-    localStorage.setItem('margin-formats', picked.join(','));
+    try { localStorage.setItem('margin-formats', picked.join(',')); }
+    catch (e) { /* nothing to remember it with */ }
   }
   boxes.forEach(b => b.addEventListener('change', update));
   update();
@@ -1673,38 +1873,53 @@ def _list_items(folder: Path) -> list[dict]:
 
 
 def _item_row(item: dict, view: str) -> str:
-    # Links go through /read/ (reader page with back-nav and share), not the
-    # raw file — essential in the home-screen web app, which has no browser
-    # chrome to navigate back with.
-    file_links = "".join(
-        f'<a href="/read/{_html_escape(f.name)}">{f.suffix[1:]}</a> '
+    """One saved item as a card. Links go through /read/, not the raw file:
+    on the home screen there is no browser chrome to come back with."""
+    file_links = " ".join(
+        f'<a class="linkish" href="/read/{_html_escape(f.name)}">{f.suffix[1:]}</a>'
         for f in item["files"]
     )
-    source = (
-        f'<a href="{_html_escape(item["source"])}">source</a>'
-        if item["source"] else ""
-    )
+    # The source comes out of front matter in a folder people and sync
+    # clients write to, so it is a URL only if it is one we would follow.
+    source = ""
+    if _safe_url(item["source"], relative_ok=False):
+        source = (f'<a class="linkish" href="{_html_escape(item["source"], True)}"'
+                  f' target="_blank" rel="noopener noreferrer">source ↗</a>')
     action = "restore" if view == "archive" else "archive"
     # Permanent deletion only from the archive view: inbox → archive → delete
     # is a deliberate two-step, and the confirm() guards against slips.
     delete_form = "" if view != "archive" else f"""
-  <form method="post" action="/delete"
-        onsubmit="return confirm('Delete permanently? This cannot be undone.')">
-    <input type="hidden" name="stem" value="{_html_escape(item["stem"])}">
-    <button type="submit" class="danger">Delete</button>
-  </form>"""
-    return f"""<div class="item">
-  <span class="date">{item["date"]}</span>
-  <div class="main">
-    <a class="title" href="/read/{_html_escape(item["files"][0].name)}">{_html_escape(item["title"])}</a>
-    <div class="links">{file_links}{source}</div>
+      <form method="post" action="/delete"
+            onsubmit="return confirm('Delete permanently? This cannot be undone.')">
+        <input type="hidden" name="stem" value="{_html_escape(item["stem"], True)}">
+        <button type="submit" class="linkish danger">delete</button>
+      </form>"""
+    return f"""<article class="item">
+  <a class="title" href="/read/{_html_escape(item["files"][0].name)}">{_html_escape(item["title"])}</a>
+  <div class="meta">
+    <time datetime="{_html_escape(item["date"], True)}">{_html_escape(item["date"])}</time>
+    {file_links}
+    {source}
+    <form class="spacer" method="post" action="/archive">
+      <input type="hidden" name="stem" value="{_html_escape(item["stem"], True)}">
+      <input type="hidden" name="action" value="{action}">
+      <button type="submit" class="linkish">{action}</button>
+    </form>{delete_form}
   </div>
-  <form method="post" action="/archive">
-    <input type="hidden" name="stem" value="{_html_escape(item["stem"])}">
-    <input type="hidden" name="action" value="{action}">
-    <button type="submit">{action.capitalize()}</button>
-  </form>{delete_form}
-</div>"""
+</article>"""
+
+
+def _tabs(view: str, inbox_n: int, archive_n: int) -> str:
+    """The two views, with the one you are in named rather than linked."""
+    def entry(name, label, count):
+        inside = (f'{label} <span class="count">{count}</span>')
+        if view == name:
+            return f'<span class="here">{inside}</span>'
+        target = "/" if name == "inbox" else "/?view=archive"
+        return f'<a href="{target}">{inside}</a>'
+
+    return (entry("inbox", "Inbox", inbox_n)
+            + entry("archive", "Archive", archive_n))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1715,29 +1930,60 @@ async def index(view: str = "inbox"):
     items = _list_items(folder)
     rows = "\n".join(_item_row(i, view) for i in items) or (
         '<p class="empty">Nothing here yet.</p>'
+        if view == "inbox" else '<p class="empty">Nothing archived yet.</p>'
     )
     inbox_n = len(_list_items(OUTPUT_DIR)) if view == "archive" else len(items)
     archive_n = len(items) if view == "archive" else len(_list_items(_archive_dir()))
     html = (_INDEX_HTML
-            .replace("__HEAD_ICONS__", _HEAD_ICONS)
+            .replace("__HEAD__", _HEAD)
             .replace("__FORMAT_CHECKBOXES__", _format_checkboxes())
-            .replace("__INBOX_COUNT__", str(inbox_n))
-            .replace("__ARCHIVE_COUNT__", str(archive_n))
+            .replace("__TABS__", _tabs(view, inbox_n, archive_n))
             .replace("__ROWS__", rows))
     return HTMLResponse(html)
+
+
+# The schemes a link in Margin's own pages may carry. Front matter comes out
+# of a folder that people and sync clients write to, so a "source" recorded
+# there is a URL only if it is one we would be willing to follow — the same
+# allowlist the reader's sanitizer uses.
+_SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
+_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+
+
+def _safe_url(url: str | None, relative_ok: bool = True) -> bool:
+    if not url:
+        return False
+    # Browsers ignore control characters inside a scheme ("java\tscript:").
+    match = _SCHEME_RE.match(re.sub(r"[\x00-\x20]", "", str(url)))
+    if match is None:
+        return relative_ok
+    return match.group(1).lower() in _SAFE_SCHEMES
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    """Whether path really lives under folder, symlinks resolved.
+
+    The output directory is a synced folder that people and sync clients
+    write to, so a name inside it can be a link to anything the account can
+    read. Serving that would turn "read my saved page" into "read that".
+    """
+    try:
+        path.resolve().relative_to(folder.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _resolve_saved_file(name: str) -> Path:
     """Locate `name` in the output dir or archive/; 404 on miss/unsafe names."""
     if "/" in name or "\\" in name or name.startswith(".") or \
             Path(name).suffix.lower() not in _SERVE_EXTS:
-        raise HTTPException(404)
-    path = OUTPUT_DIR / name
-    if not path.is_file():
-        path = _archive_dir() / name
-    if not path.is_file():
-        raise HTTPException(404)
-    return path
+        raise HTTPException(404, "No such file")
+    for folder in (OUTPUT_DIR, _archive_dir()):
+        path = folder / name
+        if path.is_file() and _inside(path, folder):
+            return path
+    raise HTTPException(404, "No such file")
 
 
 @app.get("/files/{name}")
@@ -1832,53 +2078,51 @@ MathJax = { tex: { inlineMath: [['$','$']], displayMath: [['$$','$$']] } };
 <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>"""
 
 _READ_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>__TITLE__ — Margin</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-__HEAD_ICONS__
-<style>
-  :root { color-scheme: light dark; --muted: #8a8a8e; --line: #88888833; }
-  body { font: 17px/1.6 -apple-system, system-ui, sans-serif;
-         max-width: 44rem; margin: 0 auto; padding: 0 1rem 3rem; }
-  header { display: flex; gap: .7rem; align-items: center;
-           padding: .7rem 0; border-bottom: 1px solid var(--line);
-           position: sticky; top: 0; background: Canvas; }
-  header a.back { text-decoration: none; white-space: nowrap; }
-  header .name { flex: 1; font-size: .82rem; color: var(--muted);
-                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  header button, header a.btn {
-    font: inherit; font-size: .82rem; padding: .3rem .7rem;
-    border: 1px solid var(--muted); border-radius: 6px;
-    background: transparent; color: inherit; cursor: pointer;
-    text-decoration: none; white-space: nowrap; }
-  main { margin-top: 1.2rem; }
-  main pre { white-space: pre-wrap; word-break: break-word; font-size: .85em; }
-  main code { background: #88888822; padding: .1em .3em; border-radius: 4px; }
-  main pre code { background: none; padding: 0; }
-  main blockquote { border-left: 3px solid var(--line); margin-left: 0;
-                    padding-left: 1rem; color: var(--muted); }
-  iframe.pdf { width: 100%; height: 85vh; border: 1px solid var(--line);
-               border-radius: 6px; }
-  .note { color: var(--muted); font-size: .85rem; }
-</style></head>
-<body>
-<header>
-  <a class="back" href="/">← Inbox</a>
-  <span class="name">__TITLE__</span>
-  <button id="share" hidden>Share</button>
-  <button id="copy" hidden>Copy</button>
-  <a class="btn" id="download" href="/files/__NAME__?download=1">Download</a>
-</header>
-<main>__CONTENT__</main>
+<html lang="en"><head><meta charset="utf-8"><title>__TITLE__ — Margin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+__HEAD__
+</head>
+<body class="reader">
+<main>
+  <header class="reader-bar">
+    <a class="back" href="/">← Margin</a>
+    <button class="linkish" id="copy" hidden>Copy text</button>
+    <button class="linkish" id="share" hidden>Share</button>
+    <a class="linkish" id="download" href="/files/__NAME__?download=1">Download</a>
+    <span class="name">__TITLE__</span>
+    <span class="note" id="note" hidden></span>
+  </header>
+  <div class="reading">__CONTENT__</div>
+</main>
 <script>
 const NAME = __NAME_JSON__;
 const FILE_URL = '/files/' + encodeURIComponent(NAME);
 const IS_TEXT = __IS_TEXT__;
-async function fileBlob() { return await (await fetch(FILE_URL)).blob(); }
+const note = document.getElementById('note');
+
+// These pages have no flash area, and an empty catch is how Copy, Share and
+// Download come to be indistinguishable from a button that does nothing.
+function say(message) {
+  note.textContent = message;
+  note.hidden = false;
+}
+function action(el, run) {
+  el.addEventListener('click', (event) => {
+    event.preventDefault();
+    Promise.resolve().then(run).catch(
+      (e) => say('Could not ' + el.textContent.toLowerCase() + ': ' + e.message));
+  });
+}
+async function fileBlob() {
+  const answer = await fetch(FILE_URL);
+  if (!answer.ok) throw new Error(answer.statusText || ('HTTP ' + answer.status));
+  return await answer.blob();
+}
 
 const shareBtn = document.getElementById('share');
 if (navigator.canShare) {
   shareBtn.hidden = false;
-  shareBtn.onclick = async () => {
+  action(shareBtn, async () => {
     const blob = await fileBlob();
     const file = new File([blob], NAME, { type: blob.type });
     try {
@@ -1887,15 +2131,15 @@ if (navigator.canShare) {
       } else {
         await navigator.share({ title: NAME, url: location.href });
       }
-    } catch (e) { /* user cancelled */ }
-  };
+    } catch (e) { /* the sheet was dismissed */ }
+  });
 }
-// Download without navigating: a plain link would replace this page with
-// the attachment URL — in the home-screen app (no browser chrome) that
-// strands the user with no way back. Fetch → blob → synthetic <a download>
-// keeps the reader in place; the href stays as a no-JS fallback.
-document.getElementById('download').addEventListener('click', async (e) => {
-  e.preventDefault();
+
+// Download without navigating: a plain link would replace this page with the
+// attachment URL — in the home-screen app, with no browser chrome, that
+// strands the reader. Fetch → blob → synthetic <a download> keeps the page;
+// the href stays as the no-script fallback.
+action(document.getElementById('download'), async () => {
   const blob = await fileBlob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1907,15 +2151,40 @@ document.getElementById('download').addEventListener('click', async (e) => {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 });
 
+// The Clipboard API is a secure-context feature and Margin is normally
+// reached over plain HTTP on a home network, where navigator.clipboard does
+// not exist at all — so Copy used to be hidden rather than offered. The
+// selection route is deprecated but is what still works there.
+async function copyText(body) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(body); return true; }
+    catch (e) { /* denied on this origin */ }
+  }
+  const box = document.createElement('textarea');
+  box.value = body;
+  box.readOnly = true;
+  box.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0';
+  document.body.appendChild(box);
+  box.select();
+  box.setSelectionRange(0, body.length);
+  let copied = false;
+  try { copied = document.execCommand('copy'); } catch (e) { copied = false; }
+  box.remove();
+  return copied;
+}
+
 const copyBtn = document.getElementById('copy');
-if (IS_TEXT && navigator.clipboard) {
+if (IS_TEXT) {
   copyBtn.hidden = false;
-  copyBtn.onclick = async () => {
-    const blob = await fileBlob();
-    await navigator.clipboard.writeText(await blob.text());
-    copyBtn.textContent = 'Copied!';
-    setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
-  };
+  action(copyBtn, async () => {
+    const body = await (await fileBlob()).text();
+    if (!await copyText(body)) {
+      throw new Error('this browser would not let the page do it — ' +
+                      'select the text and copy it yourself');
+    }
+    copyBtn.textContent = 'Copied';
+    setTimeout(() => { copyBtn.textContent = 'Copy text'; }, 1500);
+  });
 }
 </script>
 __MATHJAX__
@@ -1948,7 +2217,7 @@ async def read_file(name: str):
         is_text = "true"
 
     page = (_READ_HTML
-            .replace("__HEAD_ICONS__", _HEAD_ICONS)
+            .replace("__HEAD__", _HEAD)
             .replace("__NAME_JSON__", json.dumps(name))  # before __NAME__!
             .replace("__NAME__", _html_escape(name))
             .replace("__TITLE__", _html_escape(name))
@@ -2025,9 +2294,11 @@ async def archive(stem: str = Form(...), action: str = Form("archive")):
 @app.get("/health")
 async def health(request: Request):
     exists = OUTPUT_DIR.exists()
+    # The path itself is not reported: /health is public (it has to be, for
+    # a probe that carries no credentials), and on a real install the path
+    # names the account it runs as. Whether it works is the useful part.
     return {
         "status": "ok",
-        "output_dir": str(OUTPUT_DIR),
         "output_dir_exists": exists,
         "output_dir_writable": exists and os.access(OUTPUT_DIR, os.W_OK),
         "saved_md_count": len(list(OUTPUT_DIR.glob("*.md"))) if exists else 0,

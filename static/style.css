@@ -1,0 +1,292 @@
+/* Margin — self-hosted read-later server. Copyright (C) 2026 Marc Schlienger
+   Licensed under the GNU AGPL v3.0 or later; see the LICENSE file.
+   Paper-and-ink look, same family as Footnote: cream paper, slate text,
+   a red rule, blue ink for the app's own marks. The :root block below is
+   the shared one — keep the two files diffable. */
+
+:root {
+  --paper: #F5EEDC;
+  --paper-deep: #EDE2C9;
+  --ink: #33394A;
+  --ink-soft: #5D6883;
+  --rule-red: #C43D33;
+  --pen-blue: #3D6BB3;
+  --ok: #3E7A4E;
+  --card: #FBF7EB;
+  --serif: "Iowan Old Style", "Palatino", "Georgia", serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.1rem 3rem;
+  padding-top: calc(1.5rem + env(safe-area-inset-top));
+}
+
+/* Header ------------------------------------------------------------- */
+
+header.masthead {
+  display: flex;
+  align-items: flex-start;
+  gap: .8rem;
+  margin-bottom: 1.2rem;
+}
+/* Sized to the h1's line box and flush with its top. Centred against the
+   whole block, an icon taller than the heading lines up with the gap under
+   it and with neither line. */
+header.masthead img {
+  border-radius: 8px;
+  width: 1.87rem;
+  height: 1.87rem;
+  margin-top: .06rem;
+  flex: none;
+}
+h1 {
+  margin: 0;
+  font: 700 1.7rem/1.1 var(--serif);
+  letter-spacing: .01em;
+}
+h1 a { color: inherit; text-decoration: none; }
+.tagline {
+  margin: .15rem 0 0;
+  font-size: .9rem;
+  color: var(--ink-soft);
+}
+
+a { color: var(--pen-blue); }
+
+/* Save form ---------------------------------------------------------- */
+
+form.saver {
+  background: var(--card);
+  border: 1px solid #DACFB2;
+  border-left: 3px solid var(--rule-red);
+  border-radius: 10px;
+  padding: .9rem;
+  box-shadow: 0 1px 3px rgba(60, 50, 20, .07);
+}
+form.saver .row { display: flex; gap: .6rem; align-items: center; }
+form.saver input[type=url] {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  font: 1.05rem/1.5 var(--serif);
+  color: var(--ink);
+  padding: .2rem 0;
+}
+form.saver input[type=url]:focus { outline: none; }
+form.saver input[type=url]::placeholder { color: #A79F8A; }
+
+button {
+  font: 600 1rem var(--sans);
+  padding: .55rem 1.1rem;
+  border: none;
+  border-radius: 8px;
+  background: var(--pen-blue);
+  color: #FBF7EB;
+  cursor: pointer;
+}
+button:active { transform: translateY(1px); }
+button[disabled] { opacity: .55; cursor: default; }
+
+/* Anything that acts on what is already on screen is a link, not a slab:
+   one filled button per view, and it is the one that starts something. */
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font: 600 .84rem var(--sans);
+  color: var(--pen-blue);
+  cursor: pointer;
+}
+.linkish:hover { text-decoration: underline; }
+.linkish.danger { color: var(--rule-red); }
+
+details.formats { margin-top: .6rem; font-size: .84rem; }
+details.formats summary { cursor: pointer; color: var(--ink-soft); }
+details.formats summary b { color: var(--ink); font-weight: 600; }
+.fmt-list {
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+  margin: .6rem 0 .2rem .2rem;
+}
+.fmt-list label { cursor: pointer; }
+.fmt-list small { color: var(--ink-soft); }
+
+#flash {
+  margin: .8rem 0 0;
+  padding: .55rem .8rem;
+  border-radius: 8px;
+  background: var(--card);
+  border-left: 3px solid var(--ok);
+  font-size: .9rem;
+}
+#flash.error { border-left-color: var(--rule-red); color: var(--rule-red); }
+
+/* Queue -------------------------------------------------------------- */
+
+.queue-head {
+  display: flex;
+  align-items: baseline;
+  gap: .9rem;
+  font: 700 1.15rem var(--serif);
+  margin: 1.8rem 0 .6rem;
+  border-bottom: 2px solid var(--rule-red);
+  padding-bottom: .25rem;
+}
+.queue-head a, .queue-head span.here {
+  font: 700 1.15rem var(--serif);
+  text-decoration: none;
+}
+.queue-head a { color: var(--ink-soft); font-weight: 500; }
+.queue-head span.here { color: var(--ink); }
+.queue-head .count { font: 500 .8rem var(--sans); color: var(--ink-soft); }
+
+#filter {
+  width: 100%;
+  font: .95rem var(--sans);
+  color: var(--ink);
+  padding: .5rem .6rem;
+  border: 1px solid #D0C5A8;
+  border-radius: 8px;
+  background: var(--paper);
+  margin-bottom: .8rem;
+}
+#filter::placeholder { color: #A79F8A; }
+
+.item {
+  background: var(--card);
+  border: 1px solid #E2D8BE;
+  border-radius: 10px;
+  padding: .75rem .9rem;
+  margin-bottom: .6rem;
+}
+.item .title {
+  display: block;
+  font: 600 1rem/1.35 var(--serif);
+  color: var(--ink);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.item .title:hover { text-decoration: underline; }
+.item .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem .7rem;
+  align-items: center;
+  margin-top: .3rem;
+  font-size: .84rem;
+  color: var(--ink-soft);
+}
+.item .meta form { display: inline; margin: 0; }
+.item .meta .spacer { margin-left: auto; }
+.empty {
+  color: var(--ink-soft);
+  background: var(--card);
+  border: 1px dashed #DACFB2;
+  border-radius: 10px;
+  padding: 1.2rem .9rem;
+  text-align: center;
+}
+
+/* Reader ------------------------------------------------------------- */
+
+body.reader { background: var(--paper); }
+header.reader-bar {
+  display: flex;
+  gap: .8rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: .6rem 0 .5rem;
+  border-bottom: 2px solid var(--rule-red);
+  position: sticky;
+  top: 0;
+  background: var(--paper);
+  z-index: 2;
+  font: .84rem var(--sans);
+}
+header.reader-bar .back { font-weight: 600; text-decoration: none; }
+header.reader-bar .name {
+  flex: 1 1 100%;
+  order: 3;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+header.reader-bar .note {
+  color: var(--rule-red);
+  flex-basis: 100%;
+  order: 4;
+}
+
+.reading {
+  font: 1.02rem/1.65 var(--serif);
+  padding-bottom: 3rem;
+}
+.reading h1, .reading h2, .reading h3 {
+  font: 600 1.2rem/1.3 var(--serif);
+  margin: 1.4rem 0 .4rem;
+  border-bottom: 1px solid var(--paper-deep);
+  padding-bottom: .2rem;
+}
+.reading h1:first-child, .reading h2:first-child { margin-top: 0; }
+.reading p { margin: .7rem 0; }
+.reading a { color: var(--pen-blue); }
+.reading a:not([href]) { color: inherit; }
+.reading img { max-width: 100%; height: auto; }
+.reading pre {
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--paper-deep);
+  padding: .5em .7em;
+  border-radius: 6px;
+  font-size: .85em;
+}
+.reading code {
+  background: var(--paper-deep);
+  padding: .1em .3em;
+  border-radius: 4px;
+}
+.reading pre code { background: none; padding: 0; }
+.reading blockquote {
+  margin: .6rem 0 .6rem .2rem;
+  padding: .1rem 0 .1rem .8rem;
+  border-left: 3px solid var(--paper-deep);
+  color: var(--ink-soft);
+}
+.reading table { border-collapse: collapse; font-size: .9em; }
+.reading th, .reading td { border: 1px solid #D0C5A8; padding: .2rem .45rem; }
+iframe.pdf {
+  width: 100%;
+  height: 82vh;
+  border: 1px solid #E2D8BE;
+  border-radius: 10px;
+  background: var(--card);
+}
+
+/* Result and error pages --------------------------------------------- */
+
+.notice {
+  background: var(--card);
+  border: 1px solid #DACFB2;
+  border-left: 3px solid var(--ok);
+  border-radius: 10px;
+  padding: 1rem;
+}
+.notice.bad { border-left-color: var(--rule-red); }
+.notice h1 { font-size: 1.3rem; }
+.notice p { margin: .6rem 0 0; }
+.notice .detail { color: var(--ink-soft); overflow-wrap: anywhere; }
