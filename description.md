@@ -408,6 +408,41 @@ if you cannot run the server.
 
 ---
 
+## Offline reading
+
+The point of a read-later queue is the train, and until there was a service
+worker the home-screen app was a blank page without a signal. Two kinds of
+response age quite differently, so `static/service-worker.js` gives each its
+own policy:
+
+- **The queue (`/`) and the shell** (`static/style.css`, the manifest, the
+  icons) are network-first. Items are added and archived constantly, so a
+  stale list is wrong while online. Offline the cached copy is served with a
+  line saying what it is — the template leaves an `<!--offline-notice-->`
+  comment where the banner belongs, so the worker fills it in rather than
+  parsing the page. A list that is quietly hours old is worse than one that
+  admits it.
+- **A saved page** (`/read/…` and `/files/…`) is cache-first with a refresh
+  behind it. These files are written once and not edited, so a page opened
+  once stays readable with no network at all. `SAVED_MAX` bounds it in
+  entries rather than bytes, and modestly: a saved PDF can be megabytes, and
+  a browser evicts the whole origin when it runs out of room.
+
+Everything else — saving, archiving, deleting — is network only. They change
+what is on the server, and pretending to do that offline is a lie the queue
+then has to un-tell.
+
+Three details are load-bearing. A URL carrying `?token=` is never stored: the
+cache key is the whole URL, so caching it would write the token into Cache
+Storage and leave it there long after the cookie made it unnecessary — and a
+401 empties both caches, because a revoked token should not leave a readable
+copy behind. Deleting an item tells the worker before the form navigates
+away, since the 404-driven cleanup only fires if someone asks for the file
+again, which offline may be never. And every cache write goes through one
+`keep()` that checks the forgotten set before the put *and again after it*,
+because a refresh already in flight when the delete arrives finishes
+afterwards and would otherwise put the page back.
+
 ## What the client is not told, and what it may do
 
 - **The output directory's path stays server-side.** `/health` is public — it

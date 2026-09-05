@@ -20,7 +20,8 @@ the math typesetting and the web fonts have finished.
   and MathML→LaTeX conversion, the reading queue, the reader, page templates.
 - `render.py` — the headless-Chromium renderer: waits for network idle, then
   MathJax/KaTeX, then fonts, then captures.
-- `static/` — `style.css` (the shared paper-and-ink look), `manifest.json`,
+- `static/` — `style.css` (the shared paper-and-ink look),
+  `service-worker.js` (offline queue and saved pages), `manifest.json`,
   `icon.svg` + generated PNGs.
 - `deploy/` — `gen_icons.py` (re-render PNGs from icon.svg), systemd unit,
   `install.sh` + `add-instance.sh` (Ubuntu, one instance per person),
@@ -60,3 +61,6 @@ shellcheck -x deploy/*.sh             # -x, or it stops at the sourced paths.sh
   home screen there is no browser chrome to navigate with.
 - Nothing in the reader may navigate away to a file: fetch it and hand it over
   as a blob instead.
+- The service worker never stores a URL carrying `?token=`, and deleting an
+  item tells it so before the form navigates — offline, nothing else ever
+  will.

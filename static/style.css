@@ -155,6 +155,16 @@ details.formats summary b { color: var(--ink); font-weight: 600; }
 .queue-head span.here { color: var(--ink); }
 .queue-head .count { font: 500 .8rem var(--sans); color: var(--ink-soft); }
 
+.offline {
+  margin: 0 0 .7rem;
+  padding: .45rem .7rem;
+  border-left: 3px solid var(--rule-red);
+  background: var(--card);
+  border-radius: 0 8px 8px 0;
+  font-size: .84rem;
+  color: var(--ink-soft);
+}
+
 #filter {
   width: 100%;
   font: .95rem var(--sans);

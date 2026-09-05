@@ -444,8 +444,11 @@ def test_delete_button_only_in_archive_view(tmp_path, monkeypatch):
     (tmp_path / "archive").mkdir()
     (tmp_path / "archive" / "2026-07-19-b.pdf").write_bytes(b"%PDF")
     client = TestClient(app.app)
-    assert 'action="/delete"' not in client.get("/").text
-    assert 'action="/delete"' in client.get("/?view=archive").text
+    # The form, not the attribute: the page's own script names that selector
+    # too, so the bare string is in every view whether a button is or not.
+    form = '<form method="post" action="/delete"'
+    assert form not in client.get("/").text
+    assert form in client.get("/?view=archive").text
 
 
 # ---------------------------------------------------------------------------
@@ -960,3 +963,54 @@ def test_an_operator_can_say_they_want_private_addresses(monkeypatch):
     want, and the operator is the one who gets to decide."""
     monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", True)
     assert app._validated_url("http://127.0.0.1:8000/health").startswith("http://")
+
+
+# ---------------------------------------------------------------------------
+# Offline reading — the wiring; the behaviour is in tests/test_browser.py
+# ---------------------------------------------------------------------------
+
+def test_the_worker_is_served_from_the_root():
+    """A worker's scope is the directory it is served from, and one under
+    /static/ could not answer for "/" — which is the queue."""
+    with TestClient(app.app) as client:
+        answer = client.get("/service-worker.js")
+    assert answer.status_code == 200
+    assert "javascript" in answer.headers["content-type"]
+    # Never from a cache without asking: a deployed fix that does not arrive
+    # is the worst kind, and this file decides what everything else does.
+    assert answer.headers.get("cache-control") == "no-cache"
+
+
+def test_the_worker_registers_before_any_token_exists(monkeypatch, tmp_path):
+    """Registration happens on the first visit, which is the visit that has
+    not authenticated yet — the same reason the icons are public."""
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    with TestClient(app.app) as client:
+        assert client.get("/service-worker.js").status_code == 200
+        assert client.get("/").status_code == 401       # everything else is not
+
+
+def test_the_queue_leaves_room_for_the_offline_line(tmp_path, monkeypatch):
+    """The worker fills the marker in rather than parsing the page."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    page = TestClient(app.app).get("/").text
+    assert "<!--offline-notice-->" in page
+    assert "navigator.serviceWorker.register('/service-worker.js')" in page
+    worker = (Path(app.__file__).parent / "static" / "service-worker.js").read_text()
+    assert "<!--offline-notice-->" in worker             # both ends of the deal
+    css = (Path(app.__file__).parent / "static" / "style.css").read_text()
+    assert ".offline {" in css
+
+
+def test_deleting_tells_the_worker_before_it_navigates(tmp_path, monkeypatch):
+    """The 404-driven cleanup only fires if someone asks for the file again,
+    and offline that may never happen — so a deleted page would stay
+    readable for ever."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "2026-07-19-a.pdf").write_bytes(b"%PDF")
+    page = TestClient(app.app).get("/?view=archive").text
+    assert "forget-stem" in page
+    worker = (Path(app.__file__).parent / "static" / "service-worker.js").read_text()
+    assert '"forget-stem"' in worker

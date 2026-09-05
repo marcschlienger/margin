@@ -157,6 +157,7 @@ _TOKEN_COOKIE = "margin_token"
 # home-screen installs) works without credentials — none of them are sensitive.
 _PUBLIC_PATHS = {
     "/health",
+    "/service-worker.js",
     "/favicon.svg",
     "/favicon.ico",
     "/favicon-32.png",
@@ -1613,6 +1614,15 @@ async def static_file(name: str):
     return FileResponse(path)
 
 
+@app.get("/service-worker.js", include_in_schema=False)
+async def service_worker():
+    # From the root, not /static/: a worker's scope is the directory it is
+    # served from, and one under /static/ could not answer for "/".
+    return FileResponse(_STATIC_DIR / "service-worker.js",
+                        media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache"})
+
+
 @app.get("/manifest.json", include_in_schema=False)
 async def manifest():
     return FileResponse(_STATIC_DIR / "manifest.json",
@@ -1749,10 +1759,29 @@ __HEAD__
   </form>
 
   <div class="queue-head">__TABS__</div>
+  <!--offline-notice-->
   <input id="filter" type="search" placeholder="Filter by title…">
   __ROWS__
 </main>
 <script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/service-worker.js')
+    .catch((e) => console.warn('SW registration failed', e));
+}
+
+// Tell the worker before the form navigates away: the 404-driven cleanup
+// only fires if someone asks for the file again, and offline that may never
+// happen — so a deleted page would stay readable for ever.
+document.querySelectorAll('form[action="/delete"]').forEach(function (form) {
+  form.addEventListener('submit', function () {
+    const stem = form.querySelector('input[name=stem]').value;
+    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+      navigator.serviceWorker.controller.postMessage(
+        {type: 'forget-stem', stem: stem});
+    }
+  });
+});
+
 document.getElementById('filter').addEventListener('input', function () {
   const q = this.value.toLowerCase();
   document.querySelectorAll('.item').forEach(function (el) {

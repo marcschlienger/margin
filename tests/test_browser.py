@@ -316,3 +316,130 @@ def test_an_error_page_has_a_way_back(page, server):
     page.click("text=← Margin")
     page.wait_for_selector(".item")
     assert page.url.rstrip("/") == server.rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# Offline reading
+# ---------------------------------------------------------------------------
+
+CACHED_STEM = """async (stem) => {
+  for (const name of await caches.keys()) {
+    const hits = await (await caches.open(name)).keys();
+    if (hits.some((r) => decodeURIComponent(r.url).includes(stem))) return true;
+  }
+  return false;
+}"""
+
+
+def _worker_ready(sheet, base):
+    sheet.goto(base)
+    sheet.wait_for_function("() => navigator.serviceWorker.controller !== null",
+                            timeout=15000)
+
+
+def test_the_worker_takes_the_shell_with_it(page, server):
+    _worker_ready(page, server)
+    shell = page.evaluate("""async () => {
+      const cache = await caches.open('margin-shell-v1');
+      const keys = await cache.keys();
+      return keys.map((r) => new URL(r.url).pathname).sort();
+    }""")
+    assert "/" in shell and "/static/style.css" in shell, shell
+
+
+def test_a_page_read_once_is_readable_with_no_network(page, server):
+    """The point of a read-later queue is the train."""
+    _worker_ready(page, server)
+    page.goto(f"{server}/read/{STEM}.md")
+    page.wait_for_selector(".reading")
+    assert page.evaluate(CACHED_STEM, STEM)
+
+    page.context.set_offline(True)
+    try:
+        page.goto(f"{server}/read/{STEM}.md")
+        assert "Riemann" in page.inner_text("body")
+    finally:
+        page.context.set_offline(False)
+
+
+def test_the_queue_says_when_it_is_the_last_one_seen(page, server):
+    """A list of items that is quietly hours old is worse than one that says
+    so. The template leaves a comment where the banner belongs, so the worker
+    fills it in rather than parsing the page."""
+    _worker_ready(page, server)
+    assert page.locator(".offline").count() == 0
+
+    page.context.set_offline(True)
+    try:
+        page.goto(server)
+        assert page.locator(".offline").count() == 1
+        assert "last queue Margin saw" in page.inner_text(".offline")
+        assert page.locator(".item").count() == 2      # still usable
+    finally:
+        page.context.set_offline(False)
+
+
+def test_deleting_an_item_empties_its_cache(page, server):
+    """A deleted page that stays in the cache is readable offline for ever,
+    which is not what Delete means. Driven through the real control."""
+    _worker_ready(page, server)
+    page.goto(f"{server}/read/{STEM}.md")
+    page.wait_for_selector(".reading")
+    assert page.evaluate(CACHED_STEM, STEM)
+
+    # Delete exists only in the archive view: inbox → archive → delete is a
+    # deliberate two-step.
+    page.goto(server)
+    page.wait_for_selector(".item")
+    page.locator(".item", has_text=TITLE).get_by_role(
+        "button", name="archive").click()
+    page.goto(f"{server}/?view=archive")
+    page.wait_for_selector(".item")
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator(".item", has_text=TITLE).get_by_role(
+        "button", name="delete").click()
+    page.wait_for_selector(".item")
+
+    assert _poll(page, CACHED_STEM, STEM, False), \
+        "the page is still cached after the item was deleted"
+
+
+def test_a_refresh_in_flight_cannot_put_a_deleted_page_back(page, server):
+    """cacheThenRefresh serves the cached page and refreshes behind it, and
+    that refresh can finish its cache.put after the delete has emptied the
+    cache. Driven through the worker's own functions, because the ordering
+    cannot be staged from outside: a sync-API route handler that sleeps
+    blocks the driver as well, so the click it is meant to interleave with
+    cannot happen until it returns."""
+    _worker_ready(page, server)
+    page.goto(f"{server}/read/{STEM}.md")
+    page.wait_for_selector(".reading")
+    assert page.evaluate(CACHED_STEM, STEM)
+
+    worker = page.context.service_workers[0]
+    still_cached = worker.evaluate("""async (stem) => {
+      const cache = await caches.open('margin-saved-v1');
+      const request = new Request(
+        new URL('/read/' + encodeURIComponent(stem + '.md'), self.location.origin));
+      await forgetStem(stem);                       // the delete lands first…
+      await keep(cache, request, new Response('<p>late</p>'));   // …then the refresh
+      return !!(await cache.match(request));
+    }""", STEM)
+    assert still_cached is False, "a late refresh put the deleted page back"
+
+
+def test_a_token_never_reaches_cache_storage(page, server):
+    """The cache key is the whole URL, so a ?token= visit would write the
+    token into storage and leave it there long after the cookie made it
+    unnecessary."""
+    _worker_ready(page, server)
+    page.goto(f"{server}/read/{STEM}.md?token=s3cret")
+    page.wait_for_selector(".reading")
+    stored = page.evaluate("""async () => {
+      const found = [];
+      for (const name of await caches.keys()) {
+        for (const r of await (await caches.open(name)).keys()) found.push(r.url);
+      }
+      return found;
+    }""")
+    assert not [u for u in stored if "token=" in u], stored
