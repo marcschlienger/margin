@@ -66,7 +66,8 @@ bookmarklet hitting `/save-page`, or from anything that can POST JSON.
 
 ### Setting up Mathpix credentials
 
-The PDF endpoint (`/save-pdf`) calls the Mathpix API. To enable it:
+PDF-to-text conversion from `/save-pdf` and direct PDF URLs calls the Mathpix
+API. To enable it:
 
 1. Sign up at [mathpix.com](https://mathpix.com) → API Console.
 2. Create an organisation and grab the `app_id` and `app_key` from the
@@ -79,8 +80,9 @@ The PDF endpoint (`/save-pdf`) calls the Mathpix API. To enable it:
 4. Restart the server. `GET /health` will now show
    `"mathpix_configured": true`.
 
-If `.env` is missing or the values are blank, `/save-url` keeps working —
-only `/save-pdf` returns an error.
+If `.env` is missing or the values are blank, page capture keeps working and
+PDFs are still stored; only their OCR-derived text formats are skipped, with a
+warning in the response.
 
 ---
 
@@ -133,7 +135,7 @@ or `{ "status": "error", "message": "..." }` — always HTTP 200.
 **Process:**
 1. Cleans the URL — iOS Shortcuts sometimes serialises long URLs with
    whitespace or even duplicates the value with a newline between copies. The
-   server splits on whitespace and keeps only the first token.
+   server removes the inserted whitespace and collapses an exact doubled URL.
 2. Fetches the page HTML using a Chrome user-agent string (avoids bot blocking).
 3. Passes the HTML through the math extraction pipeline (see below).
 4. Writes the `.md` file to the output directory (see `OUTPUT_DIR` /
@@ -438,13 +440,19 @@ Storage and leave it there long after the cookie made it unnecessary — and a
 401 empties both caches, because a revoked token should not leave a readable
 copy behind. Deleting an item tells the worker before the form navigates
 away, since the 404-driven cleanup only fires if someone asks for the file
-again, which offline may be never. And every cache write goes through one
-`keep()` that checks the forgotten set before the put *and again after it*,
-because a refresh already in flight when the delete arrives finishes
-afterwards and would otherwise put the page back.
+again, which offline may be never. And every cache write carries the stem's
+generation from the moment its fetch began: deleting increments it, so a
+refresh already in flight cannot put the page back afterwards, while a
+genuinely new save with the same stem can still be cached.
 
 ## What the client is not told, and what it may do
 
+- **Every outbound hop is checked.** Literal loopback, private, link-local,
+  reserved and metadata addresses are refused on the initial URL, after HTTP
+  redirects, and on Chromium subrequests. DNS names are not resolved and
+  pinned by Margin, so a hostile name that resolves inward remains a known
+  residual; `MARGIN_ALLOW_PRIVATE_URLS=1` deliberately removes the boundary
+  for an operator saving an internal wiki.
 - **The output directory's path stays server-side.** `/health` is public — it
   has to be, for a probe that carries no credentials — and on a real install
   the path names the account the service runs as. It reports whether the
@@ -455,9 +463,10 @@ afterwards and would otherwise put the page back.
   the documented private-network default — any page could archive, restore or
   delete a saved item; verified against a running instance before the guard
   existed. Requests that change something are refused when the browser marks
-  them `Sec-Fetch-Site: cross-site`. Browsers send that header and nothing
-  else does, so `curl`, the Shortcut and RSS readers are unaffected, and GET
-  stays open because the bookmarklet is a cross-site navigation by design.
+  them `Sec-Fetch-Site: cross-site`. The bookmarklet's state-changing GET is
+  accepted cross-site only as a top-level document navigation, not as a
+  subresource or background fetch. Browsers send those headers and ordinary
+  API clients do not, so `curl`, the Shortcut and RSS readers are unaffected.
   Cross-origin *reading* is opt-in through `MARGIN_CORS_ORIGINS`; the
   wildcard that used to be the default let any page read the answers.
 - **A saved file is a file inside the folder.** `/files` and `/read` resolve

@@ -222,8 +222,8 @@ Debug helper: echoes method, headers, and parsed body of the request back.
 |---|---|---|
 | Output directory | `--output-dir` flag > `OUTPUT_DIR` env var (both also read from `.env`) | iCloud `ReadLater/inbox` on macOS, `~/ReadLater/inbox` elsewhere |
 | Bind address / port | `--host` / `--port` flags, or `HOST` / `PORT` env vars | `0.0.0.0` / `8000` |
-| Default formats | `DEFAULT_FORMATS` in `.env` (subset of `pdf,md,tex,org`) | `pdf,md,tex` |
-| Mathpix credentials | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` in `.env` | unset — `/save-pdf` disabled |
+| Default formats | `DEFAULT_FORMATS` in `.env` (subset of `pdf,md,tex,org`; an invalid value stops startup) | `pdf,md,tex` |
+| Mathpix credentials | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` in `.env` | unset — PDFs are kept, but PDF-to-text OCR is skipped |
 | API token | `MARGIN_TOKEN` in `.env` | unset — no authentication |
 | Cross-origin access | `MARGIN_CORS_ORIGINS` in `.env` (comma-separated origins) | unset — no cross-origin access |
 | Saves to private addresses | `MARGIN_ALLOW_PRIVATE_URLS` in `.env` | unset — loopback, LAN and metadata addresses refused |
@@ -243,7 +243,9 @@ Clients can present the token three ways:
   Shortcuts (one extra header field; see
   [shortcut_setup.md](shortcut_setup.md)). Keeps the token out of access logs.
 - **`?token=<token>` query parameter** — for URL-only contexts like the
-  bookmarklet. Query strings do appear in the server's access log.
+  bookmarklet. A browser is redirected immediately to the same URL without
+  the token, keeping it out of the address bar and later history; the first
+  request necessarily still appears once in the server's access log.
 - **Browser cookie** — open `http://YOUR-SERVER:8000/?token=<token>` once and
   the token is stored in an `HttpOnly`, `SameSite=Strict` cookie (1 year);
   after that the queue UI, file links, and archive buttons work with no
@@ -269,17 +271,23 @@ machine — loopback, `10.x`, `192.168.x`, link-local, cloud metadata — would
 be a way to read those services *through* Margin, and with no token that is
 open to anyone who can reach the port. Such addresses are refused, including
 the shorthands a resolver accepts (`127.1`, `2130706433`, `0x7f000001`) and
-names that IDNA folds onto them. Set `MARGIN_ALLOW_PRIVATE_URLS=1` if you
-save from an internal wiki and want it back.
+names that IDNA folds onto them. The check is repeated after every redirect
+and for every Chromium subrequest. A DNS name is still resolved by the HTTP
+client or browser, not resolved and pinned by Margin, so a hostile name that
+changes or resolves to an internal address remains outside this guarantee.
+Set `MARGIN_ALLOW_PRIVATE_URLS=1` if you save from an internal wiki and want
+it back.
 
 **A page you are visiting cannot change anything here.** A plain HTML form
 posts cross-origin without a preflight and the browser sends it whether or
 not the answer can be read, so with `MARGIN_TOKEN` unset — the private-network
 default — any site could have archived, restored or deleted your saved items.
 Requests that change something are refused when the browser marks them
-cross-site (`Sec-Fetch-Site: cross-site`). `curl`, the iOS Shortcut and RSS
-readers send no such header and are unaffected, and `GET` stays open because
-the bookmarklet's whole job is a cross-site navigation to `/save-page`.
+cross-site (`Sec-Fetch-Site: cross-site`). The bookmarklet's GET is the one
+state-changing exception, and is accepted cross-site only as a top-level
+document navigation—not as an image, iframe, script or background request.
+`curl`, the iOS Shortcut and RSS readers send no such header and are
+unaffected.
 
 ## Remote access via Tailscale
 
@@ -341,8 +349,9 @@ changes.
 ## Install
 
 Requirements: Python ≥ 3.10 (the installer refuses anything older rather
-than starting a service that fails inside a save). Optional: `pandoc` (for `.tex`/`.org`
-companions), Mathpix credentials (for `/save-pdf`).
+than starting a service that fails inside a save). Optional: `pandoc` (for
+`.tex`/`.org` companions), Mathpix credentials (for PDF-to-text OCR from
+uploads and direct PDF URLs).
 
 ### Local / macOS
 

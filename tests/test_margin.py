@@ -7,6 +7,7 @@
 Run with:  python -m pytest
 No network, browser, or Mathpix access required.
 """
+import asyncio
 import re
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 import app
@@ -102,6 +104,11 @@ def test_clean_title_strips_site_suffix():
     assert app._clean_title("Article Name | Site") == "Article Name"
     assert app._clean_title("Article — Site") == "Article"
 
+def test_titles_are_one_safe_line():
+    title = app._clean_title(" First\nsecond\x00\ud800 | Site ")
+    assert title == "First second\ufffd"
+    title.encode("utf-8")
+
 def test_slugify():
     assert app._slugify("Hello, Wörld!") == "hello-world"
     assert app._slugify("") == "untitled"
@@ -129,6 +136,14 @@ def test_formats_validation():
     assert p.formats == ["pdf", "tex", "org"]
     with pytest.raises(ValueError):
         app.SavePayload(url="https://a.test/x", formats=["docx"])
+    for malformed in (None, 5, [5], [{}], [None]):
+        with pytest.raises(ValueError):
+            app.SavePayload(url="https://a.test/x", formats=malformed)
+
+
+def test_default_formats_fail_loudly_on_a_typo():
+    with pytest.raises(RuntimeError, match="DEFAULT_FORMATS"):
+        app._parse_default_formats("pdf,markdonw")
 
 
 def test_default_formats_shared_everywhere():
@@ -167,6 +182,41 @@ def test_write_all_formats_md_only(tmp_path, monkeypatch):
     assert [p.suffix for p in written] == [".md"]
     assert not (tmp_path / "2026-07-19-t.tex").exists()
     assert not (tmp_path / "2026-07-19-t.org").exists()
+
+
+def test_a_text_only_save_reserves_the_whole_file_family(tmp_path, monkeypatch):
+    """Checking only the absent `.md` let a TeX-only save overwrite `.tex`."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    original = tmp_path / "2026-07-19-t.tex"
+    original.write_text("keep me", encoding="utf-8")
+
+    def fake_tex(source, target, title):
+        target.write_text("new", encoding="utf-8")
+
+    monkeypatch.setattr(app, "_write_tex", fake_tex)
+    written = app._write_all_formats(
+        "2026-07-19-t.md", "# T", "T", ("tex",)
+    )
+    assert original.read_text() == "keep me"
+    assert [p.name for p in written] == ["2026-07-19-t-2.tex"]
+
+
+def test_atomic_org_output_names_its_writer_explicitly(tmp_path, monkeypatch):
+    """The atomic temp ends in `.tmp`, so Pandoc cannot infer Org from it."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    seen = []
+
+    def fake_pandoc(args, label):
+        seen.extend(args)
+        Path(args[args.index("-o") + 1]).write_text("* T", encoding="utf-8")
+        return 0, "", ""
+
+    monkeypatch.setattr(app, "_run_pandoc", fake_pandoc)
+    written = app._write_all_formats(
+        "2026-07-19-t.md", "# T", "T", ("org",)
+    )
+    assert [p.name for p in written] == ["2026-07-19-t.org"]
+    assert seen[seen.index("-t") + 1] == "org"
 
 
 @pytest.mark.skipif(shutil.which("pandoc") is None, reason="pandoc not installed")
@@ -232,7 +282,7 @@ def test_save_pdf_upload_keeps_file_and_ocrs(tmp_path, monkeypatch):
     _patch_direct_pdf(monkeypatch, tmp_path, mathpix=True)
     with TestClient(app.app) as client:
         r = client.post("/save-pdf",
-                        files={"file": ("doc.pdf", b"%PDF fake", "application/pdf")})
+                        files={"file": ("doc.pdf", b"%PDF-1.4 fake", "application/pdf")})
     d = r.json()
     assert d["status"] == "ok"
     assert any(f.endswith(".pdf") for f in d["files"])   # uploaded PDF kept
@@ -243,12 +293,31 @@ def test_save_pdf_upload_without_mathpix_keeps_pdf(tmp_path, monkeypatch):
     _patch_direct_pdf(monkeypatch, tmp_path, mathpix=False)
     with TestClient(app.app) as client:
         r = client.post("/save-pdf",
-                        files={"file": ("doc.pdf", b"%PDF fake", "application/pdf")})
+                        files={"file": ("doc.pdf", b"%PDF-1.4 fake", "application/pdf")})
     d = r.json()
     assert d["status"] == "ok"
     assert any(f.endswith(".pdf") for f in d["files"])
     assert not any(f.endswith(".md") for f in d["files"])
     assert any("Mathpix" in w for w in d.get("warnings", []))
+
+
+def test_a_non_pdf_is_rejected_before_paid_ocr(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app, "MATHPIX_APP_ID", "id")
+    monkeypatch.setattr(app, "MATHPIX_APP_KEY", "key")
+    called = False
+
+    async def fake_mathpix(data):
+        nonlocal called
+        called = True
+        return ""
+
+    monkeypatch.setattr(app, "_mathpix_pdf", fake_mathpix)
+    answer = TestClient(app.app).post(
+        "/save-pdf", files={"file": ("wrong.pdf", b"plain text", "application/pdf")}
+    ).json()
+    assert answer["status"] == "error"
+    assert called is False
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +330,12 @@ def test_url_scheme_validation():
     with pytest.raises(ValueError):
         app._validated_url("javascript:alert(1)")
     assert app._validated_url(" https://a.test/b ") == "https://a.test/b"
+    with pytest.raises(ValueError, match="Unicode"):
+        app._validated_url("https://a.test/\ud800")
+    with pytest.raises(ValueError, match="credentials"):
+        app._validated_url("https://user:secret@example.com/article")
+    with pytest.raises(ValueError, match="too long"):
+        app._validated_url("https://example.com/" + "x" * app.MAX_URL_CHARS)
 
 def test_shortcut_url_deduplication():
     doubled = "https://a.test/x\nhttps://a.test/x"
@@ -272,6 +347,33 @@ def test_norm_url():
     assert app._norm_url("HTTPS://A.Test/x/") == app._norm_url("https://a.test/x")
     assert app._norm_url("https://a.test/x#frag") == app._norm_url("https://a.test/x")
     assert app._norm_url("https://a.test/x?q=1") != app._norm_url("https://a.test/x")
+
+
+def test_http_redirects_are_checked_before_the_next_request(monkeypatch):
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", False)
+    seen = []
+
+    def answer(request):
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "http://127.0.0.1/private"})
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(answer), follow_redirects=True,
+            event_hooks={"request": [app._validate_outbound_request]},
+        ) as client:
+            with pytest.raises(httpx.RequestError, match="policy"):
+                await client.get("https://example.com/start")
+
+    asyncio.run(run())
+    assert seen == ["https://example.com/start"]
+
+
+def test_browser_policy_checks_redirects_and_subresources(monkeypatch):
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", False)
+    assert app._browser_url_allowed("https://example.com/page")
+    assert app._browser_url_allowed("data:text/plain,ok")
+    assert not app._browser_url_allowed("http://127.0.0.1/private")
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +424,13 @@ def test_list_items_groups_and_titles(tmp_path, monkeypatch):
     assert items[0]["title"] == "Real Title"
     assert items[1]["title"] == "b"
     assert [f.suffix for f in items[0]["files"]] == [".pdf", ".md"]
+
+
+def test_frontmatter_is_read_to_its_delimiter(tmp_path):
+    note = tmp_path / "long.md"
+    title = "A" * 3000
+    note.write_text(f'---\ntitle: "{title}"\nsource_url: "https://example.test/x"\n---\nbody')
+    assert app._read_frontmatter_field(note, "source_url") == "https://example.test/x"
 
 
 # ---------------------------------------------------------------------------
@@ -378,8 +487,10 @@ def test_auth_enforced_and_cookie_flow(tmp_path, monkeypatch):
     ).status_code == 401
 
     # Query token works and sets the SameSite=Strict cookie...
-    r = client.get("/?token=s3cret")
+    r = client.get("/?token=s3cret", headers={"Accept": "text/html"})
     assert r.status_code == 200
+    assert r.history and r.history[0].status_code == 303
+    assert "token=" not in str(r.url)
     assert "margin_token" in r.cookies or "margin_token" in client.cookies
     # ...after which plain browsing works via the cookie
     assert client.get("/").status_code == 200
@@ -405,6 +516,29 @@ def test_icons_public_even_with_token(monkeypatch, tmp_path):
         assert r.headers["content-type"].startswith(ctype), path
 
 
+def test_validation_errors_do_not_echo_unencodable_input(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    client = TestClient(app.app)
+    raw = b'{"url":"https://example.com/\\ud800","formats":["md"]}'
+    answer = client.post("/save", content=raw,
+                         headers={"content-type": "application/json"})
+    assert answer.status_code == 422
+    answer.content.decode("utf-8")
+    assert client.get("/health").status_code == 200
+
+
+def test_echo_redacts_credentials(monkeypatch):
+    monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
+    client = TestClient(app.app)
+    client.cookies.set("margin_token", "s3cret")
+    answer = client.post(
+        "/echo", headers={"Authorization": "Bearer s3cret"},
+        content=b"hello",
+    ).json()
+    assert answer["headers"]["authorization"] == "[redacted]"
+    assert answer["headers"]["cookie"] == "[redacted]"
+
+
 def test_health_open_and_reports_auth(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "MARGIN_TOKEN", "s3cret")
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
@@ -412,6 +546,20 @@ def test_health_open_and_reports_auth(monkeypatch, tmp_path):
         r = client.get("/health")
         assert r.status_code == 200
         assert r.json()["auth_required"] is True
+
+
+def test_pages_and_files_carry_the_sibling_security_headers(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-a.md").write_text("body", encoding="utf-8")
+    client = TestClient(app.app)
+    for url in ("/", "/read/2026-07-19-a.md", "/files/2026-07-19-a.md",
+                "/service-worker.js"):
+        headers = client.get(url).headers
+        assert headers["x-content-type-options"] == "nosniff", url
+        assert headers["referrer-policy"] == "no-referrer", url
+        csp = headers["content-security-policy"]
+        assert "form-action 'self'" in csp and "base-uri 'none'" in csp, url
+    assert client.get("/").headers["cache-control"] == "no-cache"
 
 
 # ---------------------------------------------------------------------------
@@ -559,11 +707,39 @@ def test_a_cross_site_request_may_not_change_anything(tmp_path, monkeypatch):
 
 
 def test_reading_is_still_allowed_across_sites():
-    """GET stays open: the bookmarklet's whole job is a cross-site
-    navigation to /save-page."""
+    """Read-only GETs stay open; the bookmarklet has its narrower check."""
     answer = TestClient(app.app).get(
         "/health", headers={"Sec-Fetch-Site": "cross-site"})
     assert answer.status_code == 200
+
+
+def test_cross_site_save_page_must_be_a_real_bookmarklet_navigation(monkeypatch):
+    """The GET endpoint writes; an image/background request must not save."""
+    called = False
+
+    async def fake_save(payload, request):
+        nonlocal called
+        called = True
+        return {"status": "ok", "title": "T", "files": ["t.pdf"]}
+
+    monkeypatch.setattr(app, "save", fake_save)
+    client = TestClient(app.app)
+    hostile = client.get(
+        "/save-page?url=https://example.com",
+        headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors",
+                 "Sec-Fetch-Dest": "image"},
+    )
+    assert hostile.status_code == 403
+    assert called is False
+
+    bookmarklet = client.get(
+        "/save-page?url=https://example.com",
+        headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate",
+                 "Sec-Fetch-Dest": "document", "Accept": "text/html"},
+    )
+    assert bookmarklet.status_code == 200
+    assert "Saved" in bookmarklet.text and "T" in bookmarklet.text
+    assert called is True
 
 
 def test_cross_origin_access_is_opt_in():
@@ -613,6 +789,35 @@ def test_a_link_out_of_the_folder_is_not_a_saved_file(tmp_path, monkeypatch):
     assert client.get("/files/2026-07-19-linked.md").status_code == 404
     assert client.get("/read/2026-07-19-linked.md").status_code == 404
     assert client.get("/files/2026-07-19-real.md").status_code == 200
+
+
+def test_a_link_out_of_the_folder_is_not_read_for_the_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    secret = tmp_path.parent / "private-frontmatter.md"
+    secret.write_text('---\ntitle: "SECRET CONTENT"\n---\n', encoding="utf-8")
+    (tmp_path / "2026-07-19-linked.md").symlink_to(secret)
+    page = TestClient(app.app).get("/").text
+    assert "SECRET CONTENT" not in page
+
+
+def test_an_archive_symlink_cannot_read_or_delete_outside_the_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    elsewhere = tmp_path.parent / "not-an-archive"
+    elsewhere.mkdir()
+    victim = elsewhere / "2026-07-19-victim.md"
+    victim.write_text('---\ntitle: "Outside"\n---\nbody', encoding="utf-8")
+    (tmp_path / "archive").symlink_to(elsewhere, target_is_directory=True)
+    client = TestClient(app.app)
+    assert "Outside" not in client.get("/?view=archive").text
+    assert client.post("/delete", data={"stem": victim.stem}).status_code == 404
+    assert victim.is_file()
+
+
+def test_queue_links_quote_real_filename_characters(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "2026-07-19-why?.md").write_text("body", encoding="utf-8")
+    page = TestClient(app.app).get("/").text
+    assert "/read/2026-07-19-why%3F.md" in page
 
 
 def test_a_source_link_is_a_url_we_would_follow(tmp_path, monkeypatch):
@@ -924,7 +1129,36 @@ def test_an_unreadable_index_says_so(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
     (tmp_path / ".saved-urls.json").write_text("{half a fi", encoding="utf-8")
     assert app._load_url_index() == {}
-    assert "unreadable" in capsys.readouterr().err      # _log writes to stderr
+    assert "unusable" in capsys.readouterr().err      # _log writes to stderr
+    assert not (tmp_path / ".saved-urls.json").exists()
+    assert len(list(tmp_path.glob(".saved-urls.corrupt-*.json"))) == 1
+
+
+def test_malformed_index_records_do_not_break_the_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / ".saved-urls.json").write_text(
+        '{"https://good.test": ["2026-07-19-good", 5], '
+        '"https://bad.test": 5}', encoding="utf-8")
+    assert app._load_url_index() == {
+        "https://good.test": ["2026-07-19-good"]
+    }
+    assert TestClient(app.app).get("/").status_code == 200
+
+
+def test_a_non_object_index_is_quarantined(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / ".saved-urls.json").write_text("[]", encoding="utf-8")
+    assert app._load_url_index() == {}
+    assert not (tmp_path / ".saved-urls.json").exists()
+    assert len(list(tmp_path.glob(".saved-urls.corrupt-*.json"))) == 1
+
+
+def test_the_url_index_cannot_be_a_link_to_another_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    outside = tmp_path.parent / "outside-index.json"
+    outside.write_text('{"https://secret.test": ["2026-07-19-secret"]}')
+    (tmp_path / ".saved-urls.json").symlink_to(outside)
+    assert app._load_url_index() == {}
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +1174,7 @@ def test_the_server_will_not_fetch_its_own_network():
     public = ["https://example.com/a", "http://example.com",
               "https://b\u00fccher.example/a"]          # IDNA names still pass
     private = ["http://127.0.0.1:8000/health", "http://localhost/x",
+               "http://127.0.0.1./x", "http://localhost./x",
                "http://127.1/x", "http://2130706433/x", "http://0x7f000001/x",
                "http://169.254.169.254/latest/meta-data/", "http://10.0.0.5/x",
                "http://192.168.1.1/x", "http://[::1]/x",

@@ -67,11 +67,12 @@ const isShell = (url) =>
 const isSaved = (url) =>
   /^\/(read|files)\/[^/]+$/.test(url.pathname);
 
-// Stems deleted during this worker's lifetime. A refresh that was already in
-// flight when the delete arrived finishes its cache.put afterwards and puts
-// the page back, so an offline read resurrects something that is gone.
-const forgotten = new Set();
-const FORGOTTEN_MAX = 100;
+// A generation per deleted stem. A refresh captures the generation before it
+// starts and may write only if it is still current. Unlike a permanent
+// tombstone, this does not stop a genuinely re-saved item with the same stem
+// from ever becoming available offline again.
+const generations = new Map();
+let cacheGeneration = 0;
 
 // "2026-07-19-title.md" → "2026-07-19-title". One item is several files.
 function stemOf(url) {
@@ -83,11 +84,16 @@ function stemOf(url) {
 
 // The only way anything is written to a cache: checked before the put and
 // again after it, because the delete can land between those two lines.
-async function keep(cache, request, response) {
+async function keep(cache, request, response, startedAt, cacheStartedAt) {
   const stem = stemOf(request.url);
-  if (stem && forgotten.has(stem)) return;
+  const generation = stem ? (generations.get(stem) || 0) : 0;
+  if (startedAt !== undefined && generation !== startedAt) return;
+  if (cacheStartedAt !== undefined && cacheGeneration !== cacheStartedAt) return;
   await cache.put(request, response);
-  if (stem && forgotten.has(stem)) await cache.delete(request);
+  if ((stem && (generations.get(stem) || 0) !== generation) ||
+      (cacheStartedAt !== undefined && cacheGeneration !== cacheStartedAt)) {
+    await cache.delete(request);
+  }
 }
 
 self.addEventListener("fetch", (event) => {
@@ -111,12 +117,16 @@ self.addEventListener("fetch", (event) => {
 });
 
 async function networkFirst(request, cacheName) {
+  const cacheStartedAt = cacheGeneration;
   try {
     const answer = await fetch(request);
     // Only successful responses: an unauthorized page must never be cached
     // as though it were the app. Awaited, because an unawaited put can still
     // be in flight when the browser decides to stop the worker.
-    if (answer.ok) await keep(await caches.open(cacheName), request, answer.clone());
+    if (answer.ok) {
+      await keep(await caches.open(cacheName), request, answer.clone(),
+                 undefined, cacheStartedAt);
+    }
     else if (answer.status === 401) await forgetEverything();
     return answer;
   } catch (err) {
@@ -130,10 +140,12 @@ async function networkFirst(request, cacheName) {
 // from the cache is marked, because a list of items that is quietly hours
 // old is worse than one that says so.
 async function queueFirst(request) {
+  const cacheStartedAt = cacheGeneration;
   try {
     const answer = await fetch(request);
     if (answer.ok) {
-      await (await caches.open(SHELL_CACHE)).put(request, answer.clone());
+      await keep(await caches.open(SHELL_CACHE), request, answer.clone(),
+                 undefined, cacheStartedAt);
     } else if (answer.status === 401) {
       await forgetEverything();
     }
@@ -148,9 +160,12 @@ async function queueFirst(request) {
 async function cacheThenRefresh(event) {
   const cache = await caches.open(SAVED_CACHE);
   const cached = await cache.match(event.request);
+  const stem = stemOf(event.request.url);
+  const startedAt = generations.get(stem) || 0;
+  const cacheStartedAt = cacheGeneration;
   const fresh = fetch(event.request).then(async (answer) => {
     if (answer.ok) {
-      await keep(cache, event.request, answer.clone());
+      await keep(cache, event.request, answer.clone(), startedAt, cacheStartedAt);
       await trim(cache, SAVED_MAX);
     } else if (answer.status === 401) {
       await forgetEverything();
@@ -171,10 +186,7 @@ async function cacheThenRefresh(event) {
 // that happened to be asked for.
 async function forgetStem(stem) {
   if (!stem) return;
-  forgotten.add(stem);
-  while (forgotten.size > FORGOTTEN_MAX) {
-    forgotten.delete(forgotten.values().next().value);
-  }
+  generations.set(stem, (generations.get(stem) || 0) + 1);
   for (const name of [SAVED_CACHE, SHELL_CACHE]) {
     const cache = await caches.open(name);
     for (const request of await cache.keys()) {
@@ -196,6 +208,7 @@ self.addEventListener("message", (event) => {
 // until its site data is cleared, which is a property of browser storage,
 // not something a server can revoke.
 async function forgetEverything() {
+  cacheGeneration += 1;
   await Promise.all([caches.delete(SHELL_CACHE), caches.delete(SAVED_CACHE)]);
 }
 

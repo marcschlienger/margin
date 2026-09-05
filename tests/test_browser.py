@@ -421,11 +421,62 @@ def test_a_refresh_in_flight_cannot_put_a_deleted_page_back(page, server):
       const cache = await caches.open('margin-saved-v1');
       const request = new Request(
         new URL('/read/' + encodeURIComponent(stem + '.md'), self.location.origin));
+      const startedAt = generations.get(stem) || 0;      // refresh starts first…
       await forgetStem(stem);                       // the delete lands first…
-      await keep(cache, request, new Response('<p>late</p>'));   // …then the refresh
+      await keep(cache, request, new Response('<p>late</p>'), startedAt);
       return !!(await cache.match(request));
     }""", STEM)
     assert still_cached is False, "a late refresh put the deleted page back"
+
+
+def test_a_new_save_with_the_same_stem_can_be_cached(page, server):
+    """A permanent forgotten set fixed the race by breaking later re-saves."""
+    _worker_ready(page, server)
+    worker = page.context.service_workers[0]
+    cached = worker.evaluate("""async (stem) => {
+      const cache = await caches.open('margin-saved-v1');
+      const request = new Request(
+        new URL('/read/' + encodeURIComponent(stem + '.md'), self.location.origin));
+      await forgetStem(stem);
+      const startedAt = generations.get(stem) || 0;      // a genuinely new fetch
+      await keep(cache, request, new Response('<p>new save</p>'), startedAt);
+      return !!(await cache.match(request));
+    }""", STEM)
+    assert cached is True
+
+
+def test_many_deletions_do_not_reopen_an_old_refresh_race(page, server):
+    """Evicting old generations made zero become current again after 100."""
+    _worker_ready(page, server)
+    worker = page.context.service_workers[0]
+    cached = worker.evaluate("""async (stem) => {
+      const cache = await caches.open('margin-saved-v1');
+      const request = new Request(
+        new URL('/read/' + encodeURIComponent(stem + '.md'), self.location.origin));
+      const startedAt = generations.get(stem) || 0;
+      await forgetStem(stem);
+      for (let i = 0; i < 110; i++) await forgetStem('other-' + i);
+      await keep(cache, request, new Response('<p>very late</p>'), startedAt);
+      return !!(await cache.match(request));
+    }""", STEM)
+    assert cached is False
+
+
+def test_a_late_response_cannot_reopen_caches_after_unauthorized(page, server):
+    _worker_ready(page, server)
+    worker = page.context.service_workers[0]
+    cached = worker.evaluate("""async () => {
+      const request = new Request(
+        new URL('/read/late-auth.md', self.location.origin));
+      const cache = await caches.open('margin-saved-v1');
+      const cacheStartedAt = cacheGeneration;
+      await forgetEverything();
+      await keep(cache, request, new Response('<p>late</p>'),
+                 undefined, cacheStartedAt);
+      const reopened = await caches.open('margin-saved-v1');
+      return !!(await reopened.match(request));
+    }""")
+    assert cached is False
 
 
 def test_a_token_never_reaches_cache_storage(page, server):

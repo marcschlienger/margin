@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from typing import Callable
 
 try:
     from playwright.async_api import (
@@ -108,11 +109,13 @@ class Renderer:
     saves); a semaphore caps concurrent renders to bound memory use.
     """
 
-    def __init__(self, max_concurrent: int = 2):
+    def __init__(self, max_concurrent: int = 2,
+                 url_allowed: Callable[[str], bool] | None = None):
         self._playwright = None
         self._browser: Browser | None = None
         self._launch_lock = asyncio.Lock()
         self._sem = asyncio.Semaphore(max_concurrent)
+        self._url_allowed = url_allowed
 
     @property
     def available(self) -> bool:
@@ -139,54 +142,91 @@ class Renderer:
             return self._browser
 
     async def render(self, url: str, timeout_s: float = 60.0) -> RenderResult:
-        browser = await self._ensure_browser()
-        async with self._sem:
-            context = await browser.new_context(
-                user_agent=CHROME_UA,
-                viewport={"width": 1280, "height": 1024},
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+
+        def remaining(cap: float | None = None) -> float:
+            left = deadline - loop.time()
+            if left <= 0:
+                raise PlaywrightTimeoutError(
+                    f"render exceeded its {timeout_s:g}s deadline"
+                )
+            return min(left, cap) if cap is not None else left
+
+        browser = await asyncio.wait_for(self._ensure_browser(), remaining())
+        await asyncio.wait_for(self._sem.acquire(), remaining())
+        try:
+            context = await asyncio.wait_for(
+                browser.new_context(
+                    user_agent=CHROME_UA,
+                    viewport={"width": 1280, "height": 1024},
+                ),
+                remaining(),
             )
             try:
-                page = await context.new_page()
+                if self._url_allowed is not None:
+                    async def enforce_url_policy(route):
+                        if self._url_allowed(route.request.url):
+                            await route.continue_()
+                        else:
+                            await route.abort("blockedbyclient")
+
+                    # This sees the main navigation again after every redirect
+                    # and all subresources. A public page therefore cannot use
+                    # Chromium as a bridge to a loopback/LAN service.
+                    await asyncio.wait_for(
+                        context.route("**/*", enforce_url_policy), remaining()
+                    )
+                page = await asyncio.wait_for(context.new_page(), remaining())
                 response = await page.goto(
-                    url, wait_until="domcontentloaded", timeout=timeout_s * 1000
+                    url, wait_until="domcontentloaded", timeout=remaining() * 1000
                 )
                 status = response.status if response else 0
                 # Best effort: pages with long-polling/analytics never go idle.
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=remaining(15) * 1000
+                    )
                 except PlaywrightTimeoutError:
                     pass
                 try:
                     await asyncio.wait_for(
-                        page.evaluate(_WAIT_FOR_MATH_JS), timeout=20
+                        page.evaluate(_WAIT_FOR_MATH_JS), timeout=remaining(20)
                     )
                 except (asyncio.TimeoutError, PlaywrightError):
                     pass
-                await page.wait_for_timeout(500)  # settle late reflows/images
+                await page.wait_for_timeout(remaining(.5) * 1000)
 
-                title = await page.title()
+                title = await asyncio.wait_for(page.title(), remaining())
                 # JS challenges sometimes clear on their own after a moment —
                 # give them a few seconds before capturing.
                 for _ in range(8):
                     if not looks_blocked(title):
                         break
-                    await page.wait_for_timeout(1000)
-                    title = await page.title()
-                html = await page.content()
+                    await page.wait_for_timeout(remaining(1) * 1000)
+                    title = await asyncio.wait_for(page.title(), remaining())
+                html = await asyncio.wait_for(page.content(), remaining())
                 # Print stylesheets on blogs often hide content or math; export
                 # the PDF with screen CSS instead.
-                await page.emulate_media(media="screen")
-                pdf = await page.pdf(
-                    format="A4",
-                    print_background=True,
-                    margin={
-                        "top": "15mm", "bottom": "15mm",
-                        "left": "12mm", "right": "12mm",
-                    },
+                await asyncio.wait_for(
+                    page.emulate_media(media="screen"), remaining()
+                )
+                pdf = await asyncio.wait_for(
+                    page.pdf(
+                        format="A4",
+                        print_background=True,
+                        margin={
+                            "top": "15mm", "bottom": "15mm",
+                            "left": "12mm", "right": "12mm",
+                        },
+                    ),
+                    remaining(),
                 )
                 return RenderResult(html=html, title=title, pdf=pdf, status=status)
             finally:
                 await context.close()
+        finally:
+            self._sem.release()
 
     async def close(self) -> None:
         if self._browser:

@@ -32,8 +32,10 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import traceback
 import unicodedata
+import uuid
 import secrets
 import tempfile
 from contextlib import asynccontextmanager
@@ -41,13 +43,14 @@ from datetime import date
 from html import escape as _html_escape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote as _url_quote, urlparse
 
 import httpx
 import trafilatura
 from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import (
@@ -55,6 +58,7 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
 )
 from pydantic import BaseModel, field_validator
 
@@ -95,10 +99,23 @@ MARGIN_TOKEN = os.getenv("MARGIN_TOKEN", "").strip()
 # boxes) honors it, so a save produces the same files however it was made.
 MD_FORMATS = ("md", "tex", "org")
 _ALL_FORMATS = ("pdf",) + MD_FORMATS
-DEFAULT_FORMATS = tuple(
-    f for f in re.split(r"[\s,]+", os.getenv("DEFAULT_FORMATS", "pdf,md,tex").lower())
-    if f in _ALL_FORMATS
-) or ("pdf",)
+
+
+def _parse_default_formats(raw: str) -> tuple[str, ...]:
+    values = [f for f in re.split(r"[\s,]+", raw.lower().strip()) if f]
+    unknown = set(values) - set(_ALL_FORMATS)
+    if unknown:
+        raise RuntimeError(
+            f"DEFAULT_FORMATS contains {sorted(unknown)}; use pdf, md, tex, org"
+        )
+    if not values:
+        raise RuntimeError("DEFAULT_FORMATS must name at least one format")
+    return tuple(dict.fromkeys(values))
+
+
+DEFAULT_FORMATS = _parse_default_formats(
+    os.getenv("DEFAULT_FORMATS", "pdf,md,tex")
+)
 # Text-only slice of the default, for the Markdown-only endpoints (/save-url,
 # /save-pdf) which can't emit a PDF.
 _DEFAULT_MD_FORMATS = tuple(f for f in DEFAULT_FORMATS if f in MD_FORMATS) or ("md",)
@@ -120,9 +137,15 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR") or _default_output_dir()).expanduser()
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     application.state.client = httpx.AsyncClient(
-        timeout=30, follow_redirects=True, headers={"User-Agent": CHROME_UA}
+        timeout=30,
+        follow_redirects=True,
+        headers={"User-Agent": CHROME_UA},
+        # httpx invokes request hooks again for redirects. Checking here, at
+        # the last boundary before I/O, means a public URL cannot redirect the
+        # server into loopback, a LAN service, or cloud metadata.
+        event_hooks={"request": [_validate_outbound_request]},
     )
-    application.state.renderer = Renderer()
+    application.state.renderer = Renderer(url_allowed=_browser_url_allowed)
     yield
     await application.state.renderer.close()
     await application.state.client.aclose()
@@ -203,6 +226,17 @@ def _request_token(request: Request) -> str:
             or request.cookies.get(_TOKEN_COOKIE, ""))
 
 
+def _token_matches(presented: str) -> bool:
+    """A malformed non-ASCII query token is simply wrong, never a 500."""
+    try:
+        return secrets.compare_digest(
+            presented.encode("utf-8", "surrogatepass"),
+            MARGIN_TOKEN.encode("utf-8", "surrogatepass"),
+        )
+    except (AttributeError, UnicodeEncodeError):
+        return False
+
+
 # The multipart framing around a PDF upload, so a file exactly at the cap
 # still fits. Anything past this is refused before a byte is stored.
 MAX_BODY_BYTES = MAX_PDF_BYTES + 1024 * 1024
@@ -249,11 +283,21 @@ async def _refuse_cross_site_writes(request: Request, call_next):
     form POST to /archive moved the item and answered 303.
 
     Sec-Fetch-Site is sent by browsers and by nothing else, so curl, the iOS
-    Shortcut and the RSS reader are unaffected. GET stays open because the
-    bookmarklet's whole job is a cross-site navigation to /save-page.
+    Shortcut and the RSS reader are unaffected. The bookmarklet's GET is
+    allowed only as the top-level document navigation it actually makes.
     """
-    if (request.method not in ("GET", "HEAD", "OPTIONS")
-            and request.headers.get("sec-fetch-site") == "cross-site"):
+    cross_site = request.headers.get("sec-fetch-site") == "cross-site"
+    mutating_request = request.method not in ("GET", "HEAD", "OPTIONS")
+    # /save-page is deliberately a GET because the bookmarklet must navigate
+    # from an HTTPS article to a commonly HTTP home server. It still changes
+    # state, so accept only the top-level document navigation the bookmarklet
+    # makes—not an image, script, iframe, or background fetch from a page.
+    disguised_write = (
+        request.url.path == "/save-page"
+        and (request.headers.get("sec-fetch-mode") != "navigate"
+             or request.headers.get("sec-fetch-dest") != "document")
+    )
+    if cross_site and (mutating_request or disguised_write):
         return JSONResponse(
             {"status": "error", "filename": "",
              "message": "Refused: a cross-site request may not change "
@@ -274,7 +318,7 @@ async def _require_token(request: Request, call_next):
     ):
         return await call_next(request)
 
-    if not secrets.compare_digest(_request_token(request), MARGIN_TOKEN):
+    if not _token_matches(_request_token(request)):
         if "text/html" in request.headers.get("accept", ""):
             return HTMLResponse(_UNAUTHORIZED_HTML, status_code=401)
         return JSONResponse(
@@ -285,15 +329,53 @@ async def _require_token(request: Request, call_next):
             status_code=401,
         )
 
-    response = await call_next(request)
     if request.query_params.get("token"):
-        # Remember a query-supplied token so plain browsing works afterwards.
-        # SameSite=Strict: never sent on cross-site requests, so third-party
-        # pages cannot ride this cookie (no CSRF).
+        # The cookie now carries it, so remove the token from a browser's
+        # address bar and later history. The first request necessarily still
+        # reaches the access log once. API clients receive their answer rather
+        # than an unexpected redirect.
+        if request.method == "GET" and "text/html" in request.headers.get("accept", ""):
+            response = RedirectResponse(
+                str(request.url.remove_query_params("token")), status_code=303
+            )
+        else:
+            response = await call_next(request)
         response.set_cookie(
             _TOKEN_COOKIE, MARGIN_TOKEN, max_age=365 * 24 * 3600,
             httponly=True, samesite="strict",
+            secure=request.url.scheme == "https",
         )
+        return response
+    return await call_next(request)
+
+
+# Margin renders text extracted from arbitrary sites and serves files from a
+# synced folder. The allowlist sanitizer is the first line; these headers keep
+# an overlooked tag or a mislabeled file from becoming executable app code.
+# Inline script/style is needed by the small server-rendered UI and MathJax.
+_SECURITY_HEADERS = {
+    "content-security-policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; "
+        "connect-src 'self'; frame-src 'self'; worker-src 'self'; "
+        "form-action 'self'; frame-ancestors 'self'; base-uri 'none'"
+    ),
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+}
+_REVALIDATE_PATHS = {"/", "/service-worker.js", "/manifest.json"}
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    path = request.url.path
+    if path in _REVALIDATE_PATHS or path.startswith("/static/"):
+        response.headers.setdefault("cache-control", "no-cache")
     return response
 
 
@@ -341,16 +423,33 @@ _MATHML_FUNC = {
 
 # Strip a trailing " | Site Name", " — Site Name", " - Site Name" from titles.
 _RE_TITLE_SUFFIX = re.compile(r"\s+[|—–\-]\s+[^|—–\-]+$")
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+_TEXT_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _has_lone_surrogate(value: str) -> bool:
+    return bool(_LONE_SURROGATE.search(value))
+
+
+def _clean_text(value) -> str:
+    """Text that is safe to log, encode as UTF-8, and write to a note."""
+    text = value if isinstance(value, str) else str(value or "")
+    text = _LONE_SURROGATE.sub("\ufffd", text)
+    return _TEXT_CONTROLS.sub("", text)
 
 
 def _clean_title(title: str) -> str:
-    title = title.strip()
+    # A title becomes one YAML field, one queue row and part of a filename.
+    # Provider metadata may contain newlines, controls, or broken Unicode.
+    title = re.sub(r"\s+", " ", _clean_text(title)).strip()
     cleaned = _RE_TITLE_SUFFIX.sub("", title)
     return cleaned if cleaned else title
 
 
 def _slugify(text: str, max_len: int = 60) -> str:
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    text = unicodedata.normalize("NFKD", _clean_text(text)).encode(
+        "ascii", "ignore"
+    ).decode()
     text = re.sub(r"[^\w\s-]", "", text.lower())
     text = re.sub(r"[-\s]+", "-", text).strip("-")
     return text[:max_len] or "untitled"
@@ -371,12 +470,13 @@ def _unique_path(path: Path) -> Path:
 
 
 def _yaml_quote(s: str) -> str:
+    s = _clean_text(s)
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _frontmatter(title: str, source_url: str | None = None,
                  has_math: bool = True) -> str:
-    lines = ["---", f"title: {_yaml_quote(title)}"]
+    lines = ["---", f"title: {_yaml_quote(_clean_title(title))}"]
     if source_url:
         lines.append(f"source_url: {_yaml_quote(source_url)}")
     lines += [
@@ -481,22 +581,65 @@ def _write_tex(md_path: Path, tex_path: Path, title: str) -> None:
            .replace("__TITLE__", _latex_escape_title(title))
            .replace("__DATE__", date.today().isoformat())
            .replace("__BODY__", body))
-    tex_path.write_text(tex, encoding="utf-8")
+    _write_text_atomically(tex_path, tex)
+
+
+def _write_bytes_atomically(path: Path, data: bytes) -> None:
+    """Replace one output without ever exposing a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.",
+                                    suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def _write_text_atomically(path: Path, text: str) -> None:
+    _write_bytes_atomically(path, _clean_text(text).encode("utf-8"))
+
+
+def _family_path(path: Path, formats: tuple[str, ...], reuse_stem: bool = False) -> Path:
+    """Pick one stem that is free for the whole requested file family.
+
+    Looking only at the Markdown name let a later TeX-only save overwrite an
+    existing `.tex`. `reuse_stem` is for adding OCR text beside the PDF this
+    same request has just written; requested targets still have to be absent.
+    """
+    stem, parent = path.stem, path.parent
+    wanted = {f".{fmt}" for fmt in formats}
+    i = 1
+    while True:
+        candidate = stem if i == 1 else f"{stem}-{i}"
+        target_exists = any((parent / f"{candidate}{ext}").exists()
+                            for ext in wanted)
+        family_exists = any((parent / f"{candidate}{ext}").exists()
+                            for ext in _SERVE_EXTS)
+        if not target_exists and (reuse_stem or not family_exists):
+            return parent / f"{candidate}{path.suffix}"
+        i += 1
 
 
 def _write_all_formats(filename: str, md_content: str, title: str,
-                       formats: tuple[str, ...] = _DEFAULT_MD_FORMATS) -> list[Path]:
+                       formats: tuple[str, ...] = _DEFAULT_MD_FORMATS,
+                       reuse_stem: bool = False) -> list[Path]:
     """Write the requested subset of .md/.tex/.org (collision-safe stem).
 
     Returns the files actually written — Pandoc-derived ones are skipped
     silently when Pandoc is unavailable, exactly as before.
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    md_path = _unique_path(OUTPUT_DIR / filename)
+    md_content = _clean_text(md_content)
+    md_path = _family_path(OUTPUT_DIR / filename, formats, reuse_stem)
     written: list[Path] = []
 
     if "md" in formats:
-        md_path.write_text(md_content, encoding="utf-8")
+        _write_text_atomically(md_path, md_content)
         written.append(md_path)
         pandoc_src = md_path
     else:
@@ -515,12 +658,21 @@ def _write_all_formats(filename: str, md_content: str, title: str,
                 written.append(tex_path)
         if "org" in formats:
             org_path = md_path.with_suffix(".org")
-            _run_pandoc(
-                [*_PANDOC_FROM, str(pandoc_src), "-o", str(org_path)],
-                f"org {org_path.name}",
+            fd, tmp_name = tempfile.mkstemp(
+                dir=org_path.parent, prefix=f".{org_path.name}.", suffix=".tmp"
             )
-            if org_path.exists():
-                written.append(org_path)
+            os.close(fd)
+            try:
+                _run_pandoc(
+                    [*_PANDOC_FROM, str(pandoc_src), "-t", "org",
+                     "-o", tmp_name],
+                    f"org {org_path.name}",
+                )
+                if Path(tmp_name).stat().st_size:
+                    os.replace(tmp_name, org_path)
+                    written.append(org_path)
+            finally:
+                Path(tmp_name).unlink(missing_ok=True)
     finally:
         if pandoc_src is not md_path:
             pandoc_src.unlink(missing_ok=True)
@@ -873,40 +1025,71 @@ def _mathpix_headers() -> dict[str, str]:
 
 
 async def _mathpix_pdf(pdf_bytes: bytes) -> str:
-    """Upload PDF, poll until done, return MMD text."""
-    async with httpx.AsyncClient(timeout=180) as client:
+    """Upload PDF, poll until done, return MMD text within one deadline."""
+    deadline = time.monotonic() + 180
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise HTTPException(504, detail="Mathpix timed out (>3 min)")
+        return left
+
+    async def get_with_retry(client, url):
+        delay = 1.0
+        while True:
+            try:
+                answer = await client.get(
+                    url, headers=_mathpix_headers(), timeout=remaining()
+                )
+                if answer.status_code not in (408, 429) and answer.status_code < 500:
+                    answer.raise_for_status()
+                    return answer
+            except httpx.TransportError:
+                pass
+            wait = min(delay, remaining())
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, 8)
+
+    async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.mathpix.com/v3/pdf",
             headers=_mathpix_headers(),
             files={"file": ("document.pdf", pdf_bytes, "application/pdf")},
             data={"options_json": _MATHPIX_PDF_OPTIONS},
+            timeout=remaining(),
         )
         resp.raise_for_status()
-        pdf_id = resp.json().get("pdf_id")
-        if not pdf_id:
-            raise HTTPException(502, detail=f"Mathpix upload failed: {resp.text}")
+        try:
+            uploaded = resp.json()
+        except ValueError:
+            uploaded = None
+        pdf_id = uploaded.get("pdf_id") if isinstance(uploaded, dict) else None
+        if not isinstance(pdf_id, str) or not pdf_id:
+            raise HTTPException(502, detail="Mathpix upload returned no PDF id")
 
-        for _ in range(60):  # ~3 min @ 3s polls
-            await asyncio.sleep(3)
-            check = await client.get(
-                f"https://api.mathpix.com/v3/pdf/{pdf_id}",
-                headers=_mathpix_headers(),
+        while True:
+            await asyncio.sleep(min(3, remaining()))
+            check = await get_with_retry(
+                client, f"https://api.mathpix.com/v3/pdf/{pdf_id}"
             )
-            check.raise_for_status()
-            status = check.json().get("status", "")
+            try:
+                progress = check.json()
+            except ValueError:
+                progress = None
+            if not isinstance(progress, dict):
+                raise HTTPException(502, detail="Mathpix status was not an object")
+            status = progress.get("status", "")
+            if not isinstance(status, str):
+                raise HTTPException(502, detail="Mathpix status was not text")
             if status == "completed":
                 break
             if status == "error":
-                raise HTTPException(502, detail=f"Mathpix error: {check.text}")
-        else:
-            raise HTTPException(504, detail="Mathpix timed out (>3 min)")
+                raise HTTPException(502, detail="Mathpix reported an error")
 
-        mmd = await client.get(
-            f"https://api.mathpix.com/v3/pdf/{pdf_id}.mmd",
-            headers=_mathpix_headers(),
+        mmd = await get_with_retry(
+            client, f"https://api.mathpix.com/v3/pdf/{pdf_id}.mmd"
         )
-        mmd.raise_for_status()
-        return mmd.text
+        return _clean_text(mmd.text)
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +1136,7 @@ def _clean_shortcut_url(v: str) -> str:
 # it should be able to say so.
 ALLOW_PRIVATE_URLS = os.getenv("MARGIN_ALLOW_PRIVATE_URLS", "").strip().lower() \
     in ("1", "true", "yes", "on")
+MAX_URL_CHARS = 8192
 
 _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -983,7 +1167,10 @@ def _ascii_host(url: str) -> str | None:
     except ValueError:
         pass
     try:
-        encoded = host.encode("idna").decode("ascii")
+        # A final DNS root dot changes no destination (`localhost.` and
+        # `127.0.0.1.` still resolve inward) but prevented literal/localhost
+        # classification when it was left attached.
+        encoded = host.encode("idna").decode("ascii").removesuffix(".")
     except (UnicodeError, ValueError):
         return None
     return encoded if _HOSTNAME_RE.fullmatch(encoded) else None
@@ -1021,17 +1208,49 @@ def is_public_http_url(url: str) -> bool:
 
 
 def _validated_url(v: str) -> str:
+    if _has_lone_surrogate(v) or _TEXT_CONTROLS.search(v):
+        raise ValueError("URL contains invalid control or Unicode characters")
     url = _clean_shortcut_url(v)
-    scheme = urlparse(url).scheme.lower()
+    if len(url) > MAX_URL_CHARS:
+        raise ValueError(f"URL is too long ({MAX_URL_CHARS} characters max)")
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
     # Only web URLs — keeps the fetcher/headless browser away from file:// etc.
     if scheme not in ("http", "https"):
-        raise ValueError(f"Only http(s) URLs are supported, got: {url[:100]}")
+        raise ValueError("Only http(s) URLs are supported")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing credentials are not supported")
     if not ALLOW_PRIVATE_URLS and not is_public_http_url(url):
         raise ValueError(
             "That address is inside this machine or its network, and Margin "
             "would fetch it and then serve the result back. Set "
             "MARGIN_ALLOW_PRIVATE_URLS=1 if that is what you want.")
     return url
+
+
+async def _validate_outbound_request(request: httpx.Request) -> None:
+    """Apply the URL policy to every HTTPX request, including redirects."""
+    url = str(request.url)
+    try:
+        _validated_url(url)
+    except (TypeError, ValueError) as exc:
+        raise httpx.RequestError(
+            f"outbound URL violates Margin's policy: {exc}",
+            request=request,
+        ) from None
+
+
+def _browser_url_allowed(url: str) -> bool:
+    scheme = urlparse(url).scheme.lower()
+    if scheme in ("data", "blob", "about"):
+        return True
+    if scheme not in ("http", "https"):
+        return False
+    try:
+        _validated_url(url)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 class URLPayload(BaseModel):
@@ -1060,14 +1279,19 @@ class SavePayload(BaseModel):
         # plain text body far more easily than a JSON array.
         if isinstance(v, str):
             v = re.split(r"[\s,]+", v)
-        v = [f.lower().lstrip(".") for f in v if f] or list(DEFAULT_FORMATS)
-        unknown = set(v) - set(_ALL_FORMATS)
+        if not isinstance(v, (list, tuple)):
+            raise ValueError("formats must be a list or comma-separated text")
+        if any(not isinstance(f, str) for f in v):
+            raise ValueError("every format must be text")
+        normalized = [f.lower().lstrip(".") for f in v if f]
+        normalized = list(dict.fromkeys(normalized)) or list(DEFAULT_FORMATS)
+        unknown = set(normalized) - set(_ALL_FORMATS)
         if unknown:
             raise ValueError(
                 f"Unknown formats {sorted(unknown)}; "
                 "use any of 'pdf', 'md', 'tex', 'org'"
             )
-        return v
+        return normalized
 
 
 @app.post("/echo")
@@ -1078,11 +1302,15 @@ async def echo(request: Request):
         body = await request.json()
     except Exception:
         body = body_bytes.decode(errors="replace")
-    return {"method": request.method, "headers": dict(request.headers), "body": body}
+    headers = dict(request.headers)
+    for sensitive in ("authorization", "cookie"):
+        if sensitive in headers:
+            headers[sensitive] = "[redacted]"
+    return {"method": request.method, "headers": headers, "body": body}
 
 
 def _log(label: str, msg: str) -> None:
-    print(f"[{label}] {msg}", file=sys.stderr, flush=True)
+    print(f"[{_clean_text(label)}] {_clean_text(msg)}", file=sys.stderr, flush=True)
 
 
 # Bodies shorter than this suggest a client-side-rendered page (the article is
@@ -1092,6 +1320,12 @@ _THIN_BODY_CHARS = 200
 
 # Cap for PDFs downloaded from a URL (uploads have their own MAX_PDF_BYTES).
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+
+
+def _looks_like_pdf(data: bytes) -> bool:
+    # ISO 32000 permits leading bytes before the header, but readers are only
+    # required to find `%PDF-` within the first 1024 bytes.
+    return b"%PDF-" in data[:1024]
 
 
 async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
@@ -1117,15 +1351,16 @@ async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
                         f"PDF at {url} exceeds {MAX_DOWNLOAD_BYTES // 2**20} MB"
                     )
                 chunks.append(chunk)
-            return b"".join(chunks)
+            data = b"".join(chunks)
+            return data if _looks_like_pdf(data) else None
     except httpx.HTTPError:
         return None
 
 
 def _write_binary(filename: str, data: bytes) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _unique_path(OUTPUT_DIR / filename)
-    path.write_bytes(data)
+    path = _family_path(OUTPUT_DIR / filename, (Path(filename).suffix.lstrip("."),))
+    _write_bytes_atomically(path, data)
     return path
 
 
@@ -1147,19 +1382,48 @@ def _url_index_path() -> Path:
     return OUTPUT_DIR / ".saved-urls.json"
 
 
+def _quarantine_url_index(path: Path, reason: str) -> None:
+    spoiled = path.with_name(
+        f"{path.stem}.corrupt-{int(time.time())}-{uuid.uuid4().hex[:6]}{path.suffix}"
+    )
+    try:
+        path.rename(spoiled)
+        _log("index", f"URL index unusable ({reason}); kept as {spoiled.name}")
+    except OSError as move_error:
+        _log("index", f"URL index unusable ({reason}); could not quarantine it: {move_error}")
+
+
 def _load_url_index() -> dict[str, list[str]]:
     path = _url_index_path()
+    if path.is_symlink() and not _inside(path, OUTPUT_DIR):
+        _log("index", "URL index is a link outside the output directory; ignoring it")
+        return {}
     try:
         idx = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError) as e:
-        # Duplicate detection quietly stops working when this happens, so it
-        # is worth one line rather than none.
-        _log("index", f"URL index unreadable ({e}); duplicates will not be "
-                      f"detected until the next save rewrites it")
+    except OSError as e:
+        _log("index", f"URL index unreadable ({e}); duplicate detection disabled")
         return {}
-    return idx if isinstance(idx, dict) else {}
+    except (ValueError, UnicodeError) as e:
+        # Preserve the evidence and make the next atomic save create a clean
+        # index rather than silently overwriting the only copy.
+        _quarantine_url_index(path, str(e))
+        return {}
+    if not isinstance(idx, dict):
+        _quarantine_url_index(path, f"expected an object, found {type(idx).__name__}")
+        return {}
+    clean: dict[str, list[str]] = {}
+    for url, stems in idx.items():
+        if (not isinstance(url, str) or _has_lone_surrogate(url)
+                or re.search(r"[\x00-\x20\x7f]", url)
+                or not isinstance(stems, list)):
+            continue
+        valid = [s for s in stems if isinstance(s, str)
+                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]*", s)]
+        if valid:
+            clean[url] = list(dict.fromkeys(valid))
+    return clean
 
 
 def _record_url(url: str, stem: str) -> None:
@@ -1203,9 +1467,9 @@ def _write_json_atomically(path: Path, data) -> None:
 def _files_for_stems(stems: set[str]) -> list[Path]:
     files = []
     for folder in (OUTPUT_DIR, _archive_dir()):
-        if folder.is_dir():
+        if folder.is_dir() and _storage_folder_safe(folder):
             files += [f for f in folder.iterdir()
-                      if f.is_file() and f.stem in stems
+                      if f.is_file() and _inside(f, folder) and f.stem in stems
                       and f.suffix.lower() in _SERVE_EXTS]
     return files
 
@@ -1217,9 +1481,11 @@ def _find_existing(url: str) -> dict | None:
     if not files:
         # Saves that predate the index: match source_url in Markdown frontmatter
         for folder in (OUTPUT_DIR, _archive_dir()):
-            if not folder.is_dir():
+            if not folder.is_dir() or not _storage_folder_safe(folder):
                 continue
             for md in folder.glob("*.md"):
+                if not _inside(md, folder):
+                    continue
                 src = _read_frontmatter_field(md, "source_url")
                 if src and _norm_url(src) == norm:
                     files = _files_for_stems({md.stem})
@@ -1292,7 +1558,8 @@ async def _direct_pdf_title(client: httpx.AsyncClient, url: str,
 
 
 async def _run_markdown_save(
-    url: str, request: Request, formats: tuple[str, ...] = _DEFAULT_MD_FORMATS
+    url: str, request: Request, formats: tuple[str, ...] = _DEFAULT_MD_FORMATS,
+    preferred_stem: str | None = None,
 ) -> dict:
     """Markdown pipeline: fetch, extract content + math, write the requested
     subset of .md/.tex/.org."""
@@ -1352,7 +1619,10 @@ async def _run_markdown_save(
 
     md = _frontmatter(title, url, has_math="$" in body) + "\n" + body
     try:
-        written = _write_all_formats(_filename(title), md, title, formats)
+        filename = f"{preferred_stem}.md" if preferred_stem else _filename(title)
+        written = _write_all_formats(
+            filename, md, title, formats, reuse_stem=preferred_stem is not None
+        )
     except Exception as e:
         _log("save-url", f"write failed: {e}\n{traceback.format_exc()}")
         return _err(f"Could not write file: {e}")
@@ -1436,7 +1706,8 @@ async def save(payload: SavePayload, request: Request):
                 mmd = await _mathpix_pdf(pdf_bytes)
                 md = _frontmatter(title, payload.url, has_math="$" in mmd) + "\n" + mmd
                 written = _write_all_formats(
-                    f"{stem}.md" if stem else _filename(title), md, title, md_formats
+                    f"{stem}.md" if stem else _filename(title), md, title, md_formats,
+                    reuse_stem=stem is not None,
                 )
                 saved.extend(p.name for p in written)
                 if written and stem is None:
@@ -1449,6 +1720,7 @@ async def save(payload: SavePayload, request: Request):
                 errors.append(f"PDF OCR failed: {e}")
     else:
         # ---- Source is a web page: render for PDF, extract HTML for text ----
+        web_stem = None
         if want_pdf:
             try:
                 rendered = await renderer.render(payload.url)
@@ -1464,6 +1736,7 @@ async def save(payload: SavePayload, request: Request):
                 title = _clean_title(rendered.title) or payload.url
                 pdf_path = _write_binary(_filename(title, "pdf"), rendered.pdf)
                 saved.append(pdf_path.name)
+                web_stem = pdf_path.stem
                 _record_url(payload.url, pdf_path.stem)
                 _log("save", f"saved → {pdf_path.name}")
             except RendererUnavailable as e:
@@ -1475,7 +1748,9 @@ async def save(payload: SavePayload, request: Request):
         if md_formats:
             # Skip the endpoint's duplicate check — this request already passed
             # it (and the PDF above would otherwise count as a duplicate).
-            md_result = await _run_markdown_save(payload.url, request, md_formats)
+            md_result = await _run_markdown_save(
+                payload.url, request, md_formats, preferred_stem=web_stem
+            )
             if md_result.get("status") == "ok":
                 saved.extend(md_result["files"])
                 title = title or md_result["title"]
@@ -1508,6 +1783,8 @@ async def save_pdf(file: UploadFile = File(...)):
     pdf_bytes = await file.read()
     if len(pdf_bytes) > MAX_PDF_BYTES:
         return _err(f"PDF too large: {len(pdf_bytes)} bytes (max {MAX_PDF_BYTES})")
+    if not _looks_like_pdf(pdf_bytes):
+        return _err("The uploaded file is not a PDF")
 
     saved: list[str] = []
     errors: list[str] = []
@@ -1545,7 +1822,7 @@ async def save_pdf(file: UploadFile = File(...)):
         try:
             written = _write_all_formats(
                 f"{stem}.md" if stem else _filename(title), md, title,
-                _DEFAULT_MD_FORMATS,
+                _DEFAULT_MD_FORMATS, reuse_stem=stem is not None,
             )
             saved.extend(p.name for p in written)
         except Exception as e:
@@ -1690,6 +1967,15 @@ def _save_page_response(ok: bool, heading: str, detail: str) -> HTMLResponse:
     ))
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    """Return a bounded 422 even when the rejected input cannot be encoded."""
+    detail = [{k: v for k, v in error.items() if k not in ("input", "ctx")}
+              for error in exc.errors()]
+    body = json.dumps({"detail": detail}, ensure_ascii=True, default=str)
+    return Response(body, media_type="application/json", status_code=422)
+
+
 @app.get("/save-page", response_class=HTMLResponse)
 async def save_page(request: Request, url: str = "",
                     formats: list[str] = Query(default=[]),
@@ -1828,6 +2114,14 @@ def _archive_dir() -> Path:
     return OUTPUT_DIR / _ARCHIVE_SUBDIR
 
 
+def _storage_folder_safe(folder: Path) -> bool:
+    """The configured root is trusted; its archive child may not escape it."""
+    if folder == OUTPUT_DIR:
+        return True
+    return (folder == _archive_dir() and not folder.is_symlink()
+            and _inside(folder, OUTPUT_DIR))
+
+
 # Quick-save format checkboxes; pre-checked to match DEFAULT_FORMATS.
 _FORMAT_LABELS = [
     ("pdf", "PDF", "the page exactly as rendered"),
@@ -1865,7 +2159,17 @@ def _pretty_stem(stem: str) -> str:
 
 def _read_frontmatter_field(md_path: Path, field: str) -> str | None:
     try:
-        head = md_path.read_text(encoding="utf-8", errors="replace")[:2048]
+        chunks: list[str] = []
+        with md_path.open(encoding="utf-8", errors="replace") as handle:
+            while sum(map(len, chunks)) < 64 * 1024:
+                chunk = handle.read(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                joined = "".join(chunks)
+                if "\n---" in joined[3:]:
+                    break
+        head = "".join(chunks)
     except OSError:
         return None
     m = re.search(rf'^{field}:\s*"?(.*?)"?\s*$', head, re.MULTILINE)
@@ -1877,9 +2181,11 @@ def _read_frontmatter_field(md_path: Path, field: str) -> str | None:
 def _list_items(folder: Path) -> list[dict]:
     """Group saved files by stem → [{stem, title, date, source, files}]."""
     groups: dict[str, list[Path]] = {}
-    if folder.is_dir():
+    if folder.is_dir() and _storage_folder_safe(folder):
         for f in folder.iterdir():
-            if f.is_file() and f.suffix.lower() in _SERVE_EXTS:
+            if (f.is_file() and _inside(f, folder)
+                    and not _has_lone_surrogate(f.name)
+                    and f.suffix.lower() in _SERVE_EXTS):
                 groups.setdefault(f.stem, []).append(f)
 
     url_by_stem = _url_by_stem()
@@ -1905,7 +2211,8 @@ def _item_row(item: dict, view: str) -> str:
     """One saved item as a card. Links go through /read/, not the raw file:
     on the home screen there is no browser chrome to come back with."""
     file_links = " ".join(
-        f'<a class="linkish" href="/read/{_html_escape(f.name)}">{f.suffix[1:]}</a>'
+        f'<a class="linkish" href="/read/{_url_quote(f.name, safe="")}">'
+        f'{f.suffix[1:]}</a>'
         for f in item["files"]
     )
     # The source comes out of front matter in a folder people and sync
@@ -1924,7 +2231,7 @@ def _item_row(item: dict, view: str) -> str:
         <button type="submit" class="linkish danger">delete</button>
       </form>"""
     return f"""<article class="item">
-  <a class="title" href="/read/{_html_escape(item["files"][0].name)}">{_html_escape(item["title"])}</a>
+  <a class="title" href="/read/{_url_quote(item["files"][0].name, safe="")}">{_html_escape(_clean_text(item["title"]))}</a>
   <div class="meta">
     <time datetime="{_html_escape(item["date"], True)}">{_html_escape(item["date"])}</time>
     {file_links}
@@ -2010,7 +2317,8 @@ def _resolve_saved_file(name: str) -> Path:
         raise HTTPException(404, "No such file")
     for folder in (OUTPUT_DIR, _archive_dir()):
         path = folder / name
-        if path.is_file() and _inside(path, folder):
+        if (_storage_folder_safe(folder) and path.is_file()
+                and _inside(path, folder) and _inside(path, OUTPUT_DIR)):
             return path
     raise HTTPException(404, "No such file")
 
@@ -2046,18 +2354,22 @@ class _HTMLSanitizer(HTMLParser):
     def __init__(self):
         super().__init__()
         self.out: list[str] = []
-        self._skip: str | None = None
+        self._skip: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style"):
-            self._skip = tag
+            self._skip.append(tag)
             return
         if self._skip or tag not in _ALLOWED_TAGS:
             return
         if tag == "a":
             href = next((v for k, v in attrs if k == "href"), "") or ""
-            if href.startswith(("http://", "https://", "#")):
-                self.out.append(f'<a href="{_html_escape(href)}" rel="noopener">')
+            if _safe_url(href):
+                external = bool(_SCHEME_RE.match(href))
+                attrs_out = ' rel="noopener noreferrer" target="_blank"' if external else ""
+                self.out.append(
+                    f'<a href="{_html_escape(href, quote=True)}"{attrs_out}>'
+                )
                 return
         self.out.append(f"<{tag}>")
 
@@ -2065,8 +2377,8 @@ class _HTMLSanitizer(HTMLParser):
         self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag):
-        if tag == self._skip:
-            self._skip = None
+        if self._skip and tag == self._skip[-1]:
+            self._skip.pop()
         elif not self._skip and tag in _ALLOWED_TAGS and tag not in ("br", "hr"):
             self.out.append(f"</{tag}>")
 
@@ -2087,15 +2399,18 @@ def _render_markdown(text: str) -> str:
     Markdown can't mangle them (e.g. underscores → <em>), then restored as
     escaped text for MathJax to typeset client-side."""
     stash: list[str] = []
+    marker = f"MARGINMATH{secrets.token_hex(12)}"
+    while marker in text:
+        marker = f"MARGINMATH{secrets.token_hex(12)}"
 
     def _stash(m: re.Match) -> str:
         stash.append(m.group(0))
-        return f"§MATH{len(stash) - 1}§"
+        return f"{marker}{len(stash) - 1}END"
 
     text = _RE_MATH_SPAN.sub(_stash, text)
     html = _sanitize_html(_markdown.markdown(text, extensions=["extra"]))
     for i, m in enumerate(stash):
-        html = html.replace(f"§MATH{i}§", _html_escape(m))
+        html = html.replace(f"{marker}{i}END", _html_escape(m))
     return html
 
 
@@ -2229,8 +2544,9 @@ async def read_file(name: str):
     mathjax = ""
 
     if ext == ".pdf":
+        file_url = "/files/" + _url_quote(name, safe="")
         content = (
-            f'<iframe class="pdf" src="/files/{_html_escape(name)}"></iframe>'
+            f'<iframe class="pdf" src="{file_url}"></iframe>'
             '<p class="note">If only the first page shows (an iOS iframe '
             'limitation), use Share or Download for the full document.</p>'
         )
@@ -2248,8 +2564,8 @@ async def read_file(name: str):
     page = (_READ_HTML
             .replace("__HEAD__", _HEAD)
             .replace("__NAME_JSON__", json.dumps(name))  # before __NAME__!
-            .replace("__NAME__", _html_escape(name))
-            .replace("__TITLE__", _html_escape(name))
+            .replace("__NAME__", _url_quote(name, safe=""))
+            .replace("__TITLE__", _html_escape(_clean_text(name)))
             .replace("__IS_TEXT__", is_text)
             .replace("__CONTENT__", content)
             .replace("__MATHJAX__", mathjax))
@@ -2268,8 +2584,7 @@ def _forget_stem(stem: str) -> None:
                 del idx[url]
     if changed:
         try:
-            _url_index_path().write_text(json.dumps(idx, indent=1),
-                                         encoding="utf-8")
+            _write_json_atomically(_url_index_path(), idx)
         except OSError as e:
             _log("index", f"could not write URL index: {e}")
 
@@ -2286,9 +2601,10 @@ async def delete_item(stem: str = Form(...)):
         raise HTTPException(400, detail="invalid stem")
     removed = 0
     for folder in (OUTPUT_DIR, _archive_dir()):
-        if folder.is_dir():
+        if folder.is_dir() and _storage_folder_safe(folder):
             for f in list(folder.iterdir()):
-                if f.is_file() and f.stem == stem and f.suffix.lower() in _SERVE_EXTS:
+                if (f.is_file() and _inside(f, folder) and f.stem == stem
+                        and f.suffix.lower() in _SERVE_EXTS):
                     f.unlink()
                     removed += 1
     if not removed:
@@ -2307,12 +2623,19 @@ async def archive(stem: str = Form(...), action: str = Form("archive")):
         src, dst, back = _archive_dir(), OUTPUT_DIR, "/?view=archive"
     else:
         src, dst, back = OUTPUT_DIR, _archive_dir(), "/"
+    if not _storage_folder_safe(src) or not _storage_folder_safe(dst):
+        raise HTTPException(409, detail="archive path is not a safe directory")
     moved = 0
     if src.is_dir():
         dst.mkdir(parents=True, exist_ok=True)
-        for f in src.iterdir():
-            if f.is_file() and f.stem == stem and f.suffix.lower() in _SERVE_EXTS:
-                f.rename(_unique_path(dst / f.name))
+        files = [f for f in src.iterdir()
+                 if (f.is_file() and _inside(f, src) and f.stem == stem
+                     and f.suffix.lower() in _SERVE_EXTS)]
+        if files:
+            formats = tuple(f.suffix.lstrip(".").lower() for f in files)
+            target = _family_path(dst / f"{stem}.md", formats)
+            for f in files:
+                f.rename(dst / f"{target.stem}{f.suffix.lower()}")
                 moved += 1
     if not moved:
         raise HTTPException(404, detail=f"no files found for {stem!r}")
