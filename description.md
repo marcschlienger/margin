@@ -101,6 +101,13 @@ independently; may also be a comma-separated string. Omitted, it uses the
 `DEFAULT_FORMATS` env setting (ships as `pdf,md,tex`), which every capture
 path shares so a save yields the same files however it was triggered.
 
+`DEFAULT_FORMATS` is also allowed to name no text format at all. The steps
+that can only write text then have nothing to do, and each says what that
+means rather than substituting one: `/save-pdf` keeps the upload and skips
+the OCR, and `/save-url` refuses and names `/save`. The alternative — an
+implicit `md` — spent Mathpix credit and wrote `.md` files for an operator
+whose whole configuration said "PDFs only".
+
 **Process:** the server probes once whether the URL serves a PDF directly
 (content type or `.pdf` extension), then branches:
 
@@ -156,9 +163,11 @@ a notification. (HTTP 4xx/5xx would otherwise abort the Shortcut silently.)
 
 **Process:**
 1. Validates the upload is a PDF `<= 50 MB`.
-2. If Mathpix is configured, OCRs the PDF (upload → poll `/v3/pdf/{pdf_id}`
-   every 3 s to `completed`, ≤ 3 min → fetch MMD), taking the title from the
-   first `#` heading. Without credentials this step is skipped with a warning.
+2. If text formats are wanted at all and Mathpix is configured, OCRs the PDF
+   (upload → poll `/v3/pdf/{pdf_id}` every 3 s to `completed`, ≤ 3 min →
+   fetch MMD), taking the title from the first `#` heading. Without
+   credentials this step is skipped with a warning; with a PDF-only
+   `DEFAULT_FORMATS` it is skipped silently, because nothing asked for it.
 3. Keeps the uploaded PDF file (when `pdf` is in `DEFAULT_FORMATS`) and writes
    the OCR'd text in the default text formats, all under one filename stem.
 
@@ -210,9 +219,14 @@ disappear from it.
 
 ### `GET /health`
 
-Returns server status, the output directory (path / exists / writable),
-saved-file counts, and whether Pandoc, Playwright, and Mathpix are available.
-Used to verify the server is running before testing Shortcuts.
+Returns server status, whether the output directory exists and is writable
+(never its path — see the containment notes), saved-file counts, whether
+Pandoc and Mathpix are configured, and two separate renderer facts:
+`playwright_available` (the Python package imports) and `chromium_installed`
+(the browser it would launch is on disk). Rendering needs both, and they come
+apart on any machine where `playwright install chromium` was never run — one
+flag reported a working renderer while every PDF save failed at launch. Used
+to verify the server is running before testing Shortcuts.
 
 ---
 
@@ -605,7 +619,7 @@ genuinely new save with the same stem can still be cached.
   has to be, for a probe that carries no credentials — and on a real install
   the path names the account the service runs as. It reports whether the
   folder exists and is writable, which is the useful half.
-- **A page you are visiting may not change anything.** CORS does not help:
+- **A page on another site may not change anything.** CORS does not help:
   a plain HTML form posts cross-origin without a preflight, and the browser
   sends it whether or not the answer can be read. With `MARGIN_TOKEN` unset —
   the documented private-network default — any page could archive, restore or
@@ -617,6 +631,31 @@ genuinely new save with the same stem can still be cached.
   API clients do not, so `curl`, the Shortcut and RSS readers are unaffected.
   Cross-origin *reading* is opt-in through `MARGIN_CORS_ORIGINS`; the
   wildcard that used to be the default let any page read the answers.
+
+  The boundary is a *site*, not an origin, and that is the limit worth
+  naming: a site is the scheme plus the registrable domain, so the port is
+  not part of it. A second service on the same host, or another machine in
+  the same tailnet, is `same-site` — the guard lets it through, and the
+  `SameSite=Strict` cookie rides along with it. Narrowing to origin would
+  refuse the bookmarklet and every same-host tool, and the header cannot tell
+  those apart from an attacker; so the guarantee is that this stops a
+  drive-by from an arbitrary website, not a hostile neighbour on the machine
+  or the tailnet. Origins in `MARGIN_CORS_ORIGINS` are exempt by design:
+  refusing their POST after answering the preflight made the documented
+  extension case impossible.
+- **Nothing is read unbounded.** An upload stops at 50 MB, a downloaded PDF
+  at 100 MB, and a page's HTML at 8 MB — and every one of those bounds sits
+  on the wire, expanding a content coding under the same limit rather than
+  handing the body to a decoder that decides how much to produce. Measured on
+  the HTML path: a 200 MiB body peaked at 1001.1 MiB before the cap and
+  9.6 MiB after it, because the bytes, the string and the parse tree all
+  exist at once.
+- **A move that fails puts the files back.** One item is several files, and
+  `rename` can fail on any of them — a full disk, a permission, the sync
+  client holding one open. Archiving used to move what it could and stop,
+  leaving the item split across both folders and complete in neither view.
+  Now the moves are undone on failure, and the error names any file the
+  rollback could not return.
 - **A saved file is a file inside the folder.** `/files` and `/read` resolve
   a name only within the output directory or its `archive/`, symlinks
   resolved — the folder is synced and written to by other software, so a name

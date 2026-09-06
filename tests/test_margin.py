@@ -162,10 +162,10 @@ def test_default_formats_shared_everywhere():
 def test_queue_checkboxes_reflect_default(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
     html = TestClient(app.app).get("/").text
-    assert 'value="pdf" checked' in html
-    assert 'value="md" checked' in html
-    assert 'value="tex" checked' in html
-    assert 'value="org" checked' not in html   # Org opt-in
+    assert 'value="pdf" data-default checked' in html
+    assert 'value="md" data-default checked' in html
+    assert 'value="tex" data-default checked' in html
+    assert 'value="org" data-default' not in html   # Org opt-in
 
 
 def test_source_link_from_index_for_pdf_only(tmp_path, monkeypatch):
@@ -1759,6 +1759,22 @@ def test_shell_variables_are_not_mistaken_for_maths():
         '$E = mc^2$ and\n\n```\necho "$HOME"\n```\n') is True
 
 
+def test_a_fence_counts_the_way_commonmark_says():
+    """Two rules the pattern used to miss: a fence may be indented up to
+    three spaces, and one that is never closed runs to the end of the
+    document. Text from Mathpix or a hand-edited file can carry either, and
+    both put a shell block back on the wrong side of the question."""
+    unclosed = "Prose.\n\n```\nexport PATH=$HOME/bin:$PATH\n"
+    assert app._has_math_outside_code(unclosed) is False
+    indented = "Prose.\n\n   ```\n   export PATH=$HOME/bin:$PATH\n   ```\n"
+    assert app._has_math_outside_code(indented) is False
+    # Four spaces is an indented code block, which extraction never emits —
+    # every <pre> comes out fenced, measured on a shell article — so it is
+    # deliberately not stripped, and dollars inside one still count.
+    assert app._has_math_outside_code(
+        "Prose.\n\n    export PATH=$HOME/bin:$PATH\n") is True
+
+
 def test_a_shell_article_is_not_tagged_as_maths(tmp_path, monkeypatch):
     """Both the front-matter tag and the reader ask the same question."""
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
@@ -1938,3 +1954,464 @@ def test_cancelling_the_delete_prompt_keeps_the_offline_copy():
     assert "forget-stem" in listener
     # …and the form says which folder it is deleting from.
     assert 'name="view"' in source
+
+
+def _page(html, status=200):
+    """A mocked response the pipeline can *stream*.
+
+    httpx will not stream a Response built from a bytes body — the content is
+    already consumed — and the fetch reads the wire raw so it can stop at
+    MAX_HTML_BYTES. An async iterator is what a real transport hands over.
+    """
+    async def body():
+        yield html.encode("utf-8")
+
+    return httpx.Response(status, content=body(),
+                          headers={"content-type": "text/html; charset=utf-8"})
+
+
+def _fake_request(answer, renderer=None):
+    """A Request stand-in for the save pipeline: it reads app.state and
+    nothing else, so a namespace with a mocked client is the whole harness."""
+    from types import SimpleNamespace
+
+    class NoRenderer:
+        available = False
+
+        async def render(self, url):        # pragma: no cover — never reached
+            raise AssertionError("renderer used when it should not be")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(answer),
+                               follow_redirects=True)
+    state = SimpleNamespace(client=client, renderer=renderer or NoRenderer())
+    return SimpleNamespace(app=SimpleNamespace(state=state)), client
+
+
+def _run_save(url, answer, formats=("md",), renderer=None):
+    request, client = _fake_request(answer, renderer)
+
+    async def go():
+        try:
+            return await app._run_markdown_save(url, request, formats)
+        finally:
+            await client.aclose()
+
+    return asyncio.run(go())
+
+
+# Cloudflare's interstitial, trimmed. What makes it the interesting case is
+# its length: extraction keeps 798 characters, four times _THIN_BODY_CHARS,
+# so nothing about the body says this is not an article.
+_CHALLENGE_PAGE = """<html><head><title>Just a moment...</title></head><body>
+<article>
+<h1>Checking your browser before you continue</h1>
+<p>This site needs to review the security of your connection before
+proceeding. The check is automatic and usually takes a few seconds.</p>
+<p>Why am I seeing this page? You may be running software that sends
+automated requests, or your network may be shared with someone who is.
+Completing the check proves you are a person and grants access for a while.</p>
+<p>What can I do to avoid it? If you are on a personal connection you can run
+an anti-virus scan to be sure your machine is not compromised. On a shared or
+office network, ask the administrator to look for misconfigured devices.</p>
+<p>Another way to pass the check is to enable cookies and JavaScript in your
+browser and reload the page. Performance and security are provided by the
+network in front of this site.</p>
+</article></body></html>"""
+
+
+def test_a_bot_wall_is_not_an_article(tmp_path, monkeypatch):
+    """Cloudflare's interstitial answers 200 with about two thousand
+    characters of prose, so the length test passed and the challenge page was
+    filed as the article. Reproduced before the fix: the save reported ok and
+    wrote a .md whose body was "Just a moment…"."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    wall = _CHALLENGE_PAGE
+
+    result = _run_save("https://x.test/a", lambda r: _page(wall))
+    assert result["status"] == "error"
+    assert "bot-check page" in result["message"]
+    assert "Just a moment" in result["message"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_bot_wall_gets_a_second_try_in_a_real_browser(tmp_path, monkeypatch):
+    """The other half of the same finding, and the half worth having: the
+    render retry only fires on a thin body, and a wall long enough to look
+    like an article is not thin. Treating the challenge as no content is what
+    lets headless Chromium — which can pass the check — have its turn."""
+    from render import RenderResult
+
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    wall = _CHALLENGE_PAGE
+    article = ("<html><head><title>Past The Wall</title></head><body><article>"
+               "<p>" + PAD + "</p></article></body></html>")
+
+    class RealBrowser:
+        available = True
+        asked = []
+
+        async def render(self, url):
+            self.asked.append(url)
+            return RenderResult(html=article, title="Past The Wall", pdf=b"",
+                                status=200)
+
+    browser = RealBrowser()
+    result = _run_save("https://x.test/a", lambda r: _page(wall),
+                       renderer=browser)
+    assert browser.asked == ["https://x.test/a"], "the wall was taken for an article"
+    assert result["status"] == "ok", result
+    saved = next(p for p in tmp_path.iterdir() if p.suffix == ".md")
+    assert "Past The Wall" in saved.read_text()
+    assert "Just a moment" not in saved.read_text()
+
+
+def test_a_real_article_still_saves(tmp_path, monkeypatch):
+    """The other half of the bot-wall test: the check must not swallow a page
+    that merely mentions waiting."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    page = ("<html><head><title>A Real Article</title></head><body><article>"
+            "<p>" + PAD + "</p></article></body></html>")
+    result = _run_save("https://x.test/a", lambda r: _page(page))
+    assert result["status"] == "ok", result
+    assert any(p.suffix == ".md" for p in tmp_path.iterdir())
+
+
+def test_a_pdf_without_an_extension_is_still_a_pdf():
+    """The early return gave up whenever the URL had no .pdf and HEAD had not
+    said it was one — including when HEAD had failed, or answered 405, and so
+    had said nothing at all. A server that refuses HEAD (many do) could never
+    serve a PDF here, however plainly its GET said application/pdf."""
+    pdf = b"%PDF-1.4\n%extensionless\n"
+
+    def serve_with(head_reply):
+        """A loopback server: `head_reply` is what it answers HEAD with."""
+        methods = []
+
+        async def run():
+            async def handle(reader, writer):
+                request = await reader.readuntil(b"\r\n\r\n")
+                method = request.split(b" ", 1)[0].decode()
+                methods.append(method)
+                if method == "HEAD":
+                    writer.write(head_reply)
+                else:
+                    writer.write(b"HTTP/1.1 200 OK\r\n"
+                                 b"Content-Type: application/pdf\r\n"
+                                 b"Content-Length: %d\r\n"
+                                 b"Connection: close\r\n\r\n%s"
+                                 % (len(pdf), pdf))
+                try:
+                    await writer.drain()
+                    writer.close()
+                except Exception:                              # noqa: BLE001
+                    pass
+
+            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with httpx.AsyncClient(timeout=10) as client:
+                try:
+                    return await app._fetch_pdf_bytes(
+                        client, f"http://127.0.0.1:{port}/paper")
+                finally:
+                    server.close()
+
+        return asyncio.run(run()), methods
+
+    # HEAD refused at the transport level: nothing was learned, so ask.
+    got, methods = serve_with(b"")
+    assert got == pdf
+    assert "GET" in methods
+
+    # HEAD answered 405 — "not this method", not "not a PDF".
+    got, methods = serve_with(b"HTTP/1.1 405 Method Not Allowed\r\n"
+                              b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+    assert got == pdf
+    assert "GET" in methods
+
+    # HEAD answered, and said it was a web page. That ends it, with no GET.
+    got, methods = serve_with(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                              b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+    assert got is None
+    assert methods == ["HEAD"]
+
+
+def test_a_save_that_asks_for_more_is_not_a_duplicate():
+    """"Already saved" meant "some file exists for this URL", so a capture
+    whose Mathpix step had failed could never be completed: asking again for
+    the missing Markdown answered "duplicate" and wrote nothing."""
+    existing = {"files": ["2026-07-19-x.pdf"], "stem": "2026-07-19-x"}
+    assert app._covers_formats(existing, ("pdf",)) is True
+    assert app._covers_formats(existing, ("md",)) is False
+    assert app._covers_formats(existing, ("pdf", "md")) is False
+    both = {"files": ["2026-07-19-x.pdf", "2026-07-19-x.md"], "stem": "2026-07-19-x"}
+    assert app._covers_formats(both, ("pdf", "md")) is True
+    assert app._covers_formats(both, ("tex",)) is False
+
+
+def test_one_capture_of_a_url_at_a_time():
+    """Two clients saving the same URL both passed the duplicate check, both
+    rendered it, and both wrote — the second under a -2 stem. The index then
+    pointed at one of two identical folders."""
+    async def go():
+        held = []
+        async with app._reserve_url("https://a.test/x") as first:
+            held.append(first)
+            async with app._reserve_url("https://A.test/x/") as second:
+                held.append(second)          # same URL once normalised
+            async with app._reserve_url("https://a.test/other") as elsewhere:
+                held.append(elsewhere)
+        async with app._reserve_url("https://a.test/x") as after:
+            held.append(after)
+        return held
+
+    assert asyncio.run(go()) == [True, False, True, True]
+    assert app._in_flight == set()           # released even so
+
+
+def test_the_text_endpoints_say_what_a_pdf_only_default_means(tmp_path, monkeypatch):
+    """DEFAULT_FORMATS=pdf used to make Markdown the default of every
+    text-only endpoint, so an operator who asked for PDFs got .md files from
+    the Shortcut and paid Mathpix to produce them from uploads."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app, "DEFAULT_FORMATS", ("pdf",))
+    monkeypatch.setattr(app, "_DEFAULT_MD_FORMATS", ())
+
+    answered = TestClient(app.app).post("/save-url",
+                                        json={"url": "https://a.test/x"})
+    assert answered.status_code == 200       # the API answers, it does not raise
+    body = answered.json()
+    assert body["status"] == "error"
+    assert "no text format" in body["message"]
+    assert "/save" in body["message"]        # and names the endpoint that can
+    assert list(tmp_path.iterdir()) == []
+
+    # An upload keeps the PDF and skips the OCR rather than buying text
+    # nobody asked for.
+    def refuse(*a, **k):                     # pragma: no cover — not called
+        raise AssertionError("Mathpix called under a PDF-only default")
+
+    monkeypatch.setattr(app, "_mathpix_pdf", refuse)
+    monkeypatch.setattr(app, "MATHPIX_APP_ID", "id")
+    monkeypatch.setattr(app, "MATHPIX_APP_KEY", "key")
+    saved = TestClient(app.app).post(
+        "/save-pdf", files={"file": ("p.pdf", b"%PDF-1.4\n%x\n",
+                                     "application/pdf")}).json()
+    assert saved["status"] == "ok"
+    assert [Path(f).suffix for f in saved["files"]] == [".pdf"]
+
+
+def test_a_pdf_only_default_asks_for_no_text():
+    """The rule itself, without the endpoints: the slice is empty rather than
+    quietly ("md",), which is what made a PDF-only configuration write .md."""
+    assert app._text_formats(("pdf",)) == ()
+    assert app._text_formats(("pdf", "md", "tex")) == ("md", "tex")
+    assert app._text_formats(("org",)) == ("org",)
+    # …and the shipped configuration is unchanged by that.
+    assert app._parse_default_formats("pdf,md,tex") == ("pdf", "md", "tex")
+    assert app._DEFAULT_MD_FORMATS == ("md", "tex")
+
+
+def test_clearing_every_format_box_says_what_will_be_saved():
+    """An unchecked box sends nothing, and /save-page falls back to
+    DEFAULT_FORMATS — so a summary reading "none" described a save that was
+    not going to happen."""
+    source = Path(app.__file__).read_text()
+    update = source[source.index("  function update() {"):]
+    update = update[:update.index("\n  }")]
+    assert "'none'" not in update
+    assert "'server default — ' + fallback" in update
+    assert "data-default" in app._format_checkboxes()
+
+
+def _served_page(body, extra_headers=b""):
+    """A loopback server that hands over `body` once, then closes.
+
+    MockTransport cannot help here: the fetch streams, and a mocked response
+    built from bytes is already consumed. Only a real socket exercises the
+    bound.
+    """
+    import types
+
+    async def run(cap_test):
+        async def serve(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            # Headers and body in two writes: joining them would copy the
+            # body inside the measured region and the harness would be what
+            # the peak is measuring.
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                         + extra_headers +
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                         % len(body))
+            writer.write(body)
+            try:
+                await writer.drain()
+            except Exception:                                  # noqa: BLE001
+                pass
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with httpx.AsyncClient(timeout=30) as client:
+            state = types.SimpleNamespace(
+                client=client,
+                renderer=types.SimpleNamespace(available=False))
+            request = types.SimpleNamespace(
+                app=types.SimpleNamespace(state=state))
+            try:
+                return await app._run_markdown_save(
+                    f"http://127.0.0.1:{port}/x", request, ("md",))
+            finally:
+                server.close()
+
+    return run
+
+
+def test_a_page_cannot_be_as_large_as_the_server_likes(monkeypatch, tmp_path):
+    """`.text` reads whatever the server sends, and the string is then parsed,
+    so a page costs several times its own size. Measured against a 200 MiB
+    body: 1001.1 MiB peak before the cap, 9.6 MiB after it."""
+    import gc
+    import tracemalloc
+
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    cap = 1 * 1024 * 1024
+    monkeypatch.setattr(app, "MAX_HTML_BYTES", cap)
+    body = (b"<html><head><title>T</title></head><body><article><p>"
+            + b"a" * (40 * cap) + b"</p></article></body></html>")
+
+    gc.collect()
+    tracemalloc.start()
+    result = asyncio.run(_served_page(body)(cap))
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    assert result["status"] == "error"
+    assert "more than 1 MB of HTML" in result["message"]
+    # The point is the size of the refusal, not the refusal: reading it all
+    # and finding no article also fails, having first built the megabytes.
+    assert peak < 8 * cap, f"{peak / 2 ** 20:.1f} MiB against a {cap} byte cap"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_compressed_page_cannot_outgrow_the_same_cap(monkeypatch, tmp_path):
+    """The bound has to sit on the wire, not on what a decoder produces —
+    otherwise the ratio is the sender's to choose, exactly as for PDFs."""
+    import gzip
+
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    cap = 1 * 1024 * 1024
+    monkeypatch.setattr(app, "MAX_HTML_BYTES", cap)
+    body = gzip.compress(b"<html><body><p>" + b"a" * (40 * cap)
+                         + b"</p></body></html>")
+    assert len(body) < cap                    # small on the wire, huge after
+
+    result = asyncio.run(
+        _served_page(body, b"Content-Encoding: gzip\r\n")(cap))
+    assert result["status"] == "error"
+    assert "once decompressed" in result["message"]
+    assert list(tmp_path.iterdir()) == []
+
+    # And the fetch reads the wire, not a decoded stream, so the bound is on
+    # bytes that exist rather than bytes a decoder decided to make.
+    source = Path(app.__file__).read_text()
+    fetch = source[source.index("async def _fetch_html("):]
+    fetch = fetch[:fetch.index("\n\n\nclass _PageTooLarge")]
+    assert "aiter_raw()" in fetch and "aiter_bytes()" not in fetch
+    assert "_inflate(" in fetch
+
+
+def test_a_streamed_page_is_still_checked_on_every_redirect(monkeypatch):
+    """The fetch went from client.get to client.stream to bound it. The hook
+    that stops a public URL redirecting the server into loopback is attached
+    to the client, not to the call — this is the test that says so, because
+    losing it would be silent and would hand back the answer."""
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", False)
+    seen = []
+
+    def answer(request):
+        seen.append(str(request.url))
+        if request.url.host == "example.com":
+            return httpx.Response(
+                302, headers={"location": "http://127.0.0.1/private"})
+        return _page("<html><body>the server's own secrets</body></html>")
+
+    async def go():
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(answer), follow_redirects=True,
+                event_hooks={"request": [app._validate_outbound_request]}
+        ) as client:
+            with pytest.raises(httpx.RequestError, match="policy"):
+                await app._fetch_html(client, "https://example.com/start")
+
+    asyncio.run(go())
+    assert seen == ["https://example.com/start"]   # loopback never attempted
+
+
+def test_an_ordinary_page_is_read_whole(monkeypatch, tmp_path):
+    """The other half of the cap: a page under it saves exactly as before,
+    charset and all — the fetch replaced Response.text, so the decoding has
+    to survive the replacement."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    body = ("<html><head><title>Größenordnung</title></head><body><article>"
+            "<p>" + PAD + " Ünïcödé survives.</p></article></body></html>"
+            ).encode("utf-8")
+
+    result = asyncio.run(_served_page(body)(None))
+    assert result["status"] == "ok", result
+    saved = next(p for p in tmp_path.iterdir() if p.suffix == ".md")
+    text = saved.read_text(encoding="utf-8")
+    assert "Größenordnung" in text
+    assert "Ünïcödé survives." in text
+
+
+def test_a_half_finished_archive_is_put_back(tmp_path, monkeypatch):
+    """One item is several files, and rename can fail on any of them — a
+    sync client holding one open is enough. A bare loop left the item split
+    across both folders, complete in neither view."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    stem = "2026-09-04-a-piece"
+    for ext, content in ((".md", "---\ntitle: \"A piece\"\n---\n\nBody.\n"),
+                         (".tex", "\\documentclass{article}\n"),
+                         (".pdf", "%PDF-1.4\n")):
+        (tmp_path / f"{stem}{ext}").write_text(content, encoding="utf-8")
+
+    real = Path.rename
+    calls = {"n": 0}
+
+    def flaky(self, target):
+        calls["n"] += 1
+        if calls["n"] == 2:               # the second of three files
+            raise OSError(13, "Permission denied")
+        return real(self, target)
+
+    monkeypatch.setattr(Path, "rename", flaky)
+    answer = TestClient(app.app).post("/archive",
+                                      data={"stem": stem, "action": "archive"})
+    assert answer.status_code == 500
+    assert "Could not archive" in answer.json()["detail"]
+
+    monkeypatch.setattr(Path, "rename", real)
+    inbox = sorted(p.name for p in tmp_path.iterdir() if p.is_file())
+    archived = sorted(p.name for p in (tmp_path / "archive").iterdir()) \
+        if (tmp_path / "archive").is_dir() else []
+    assert inbox == [f"{stem}.md", f"{stem}.pdf", f"{stem}.tex"], inbox
+    assert archived == [], archived
+
+
+def test_an_archive_that_works_still_moves_the_whole_family(tmp_path, monkeypatch):
+    """The rollback must not have cost the ordinary case."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    stem = "2026-09-04-a-piece"
+    for ext in (".md", ".tex", ".pdf"):
+        (tmp_path / f"{stem}{ext}").write_text("x", encoding="utf-8")
+
+    client = TestClient(app.app)
+    assert client.post("/archive", data={"stem": stem, "action": "archive"},
+                       follow_redirects=False).status_code == 303
+    assert sorted(p.name for p in (tmp_path / "archive").iterdir()) == \
+        [f"{stem}.md", f"{stem}.pdf", f"{stem}.tex"]
+    assert [p.name for p in tmp_path.iterdir() if p.is_file()] == []
+
+    assert client.post("/archive", data={"stem": stem, "action": "restore"},
+                       follow_redirects=False).status_code == 303
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == \
+        [f"{stem}.md", f"{stem}.pdf", f"{stem}.tex"]

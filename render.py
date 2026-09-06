@@ -26,6 +26,7 @@ import asyncio
 import inspect
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 try:
@@ -120,7 +121,30 @@ class Renderer:
 
     @property
     def available(self) -> bool:
+        """Whether a render is worth attempting: the package imports."""
         return PLAYWRIGHT_AVAILABLE
+
+    async def chromium_installed(self) -> bool:
+        """Whether the browser Playwright would launch is actually on disk.
+
+        Not the same fact as `available`: pip installs the package,
+        `playwright install chromium` installs the browser, and a machine
+        with only the first reports a working renderer while every render
+        fails on launch. Checking the executable rather than launching one
+        keeps a health probe cheap; a browser already connected has proved
+        the stronger version of the claim and is answered straight away.
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            return False
+        if self._browser is not None and self._browser.is_connected():
+            return True
+        try:
+            async with self._launch_lock:
+                if self._playwright is None:
+                    self._playwright = await async_playwright().start()
+                return Path(self._playwright.chromium.executable_path).exists()
+        except Exception:                                      # noqa: BLE001
+            return False
 
     async def _ensure_browser(self) -> Browser:
         if not PLAYWRIGHT_AVAILABLE:

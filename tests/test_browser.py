@@ -494,3 +494,31 @@ def test_a_token_never_reaches_cache_storage(page, server):
       return found;
     }""")
     assert not [u for u in stored if "token=" in u], stored
+
+
+def test_the_format_summary_names_what_an_empty_choice_saves(page, server):
+    """Clearing every box does not save nothing: the checkboxes are a GET
+    form, an unchecked box sends no field at all, and /save-page falls back
+    to DEFAULT_FORMATS. The summary said "none", which described a save that
+    was never going to happen."""
+    _queue(page, server)
+    summary = page.locator("#fmt-summary")
+    assert summary.inner_text() == "PDF, Markdown, LaTeX"
+    page.locator("details.formats > summary").click()      # the boxes fold away
+
+    page.locator(".fmt-list input[type=checkbox]").first.uncheck()
+    assert summary.inner_text() == "Markdown, LaTeX"
+
+    for box in page.locator(".fmt-list input[type=checkbox]").all():
+        if box.is_checked():
+            box.uncheck()
+    assert summary.inner_text() == "server default — PDF, Markdown, LaTeX"
+
+    # And that is the truth: submitting with nothing ticked sends no formats
+    # field, and the server saves its default set.
+    sent = page.evaluate(
+        "new URL(document.querySelector('form.saver').action).pathname")
+    assert sent == "/save-page"
+    fields = page.evaluate(
+        "Array.from(new FormData(document.querySelector('form.saver')).keys())")
+    assert "formats" not in fields

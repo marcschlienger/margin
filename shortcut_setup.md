@@ -15,20 +15,22 @@ a Mac on your network, an Ubuntu server, or any machine over Tailscale.
 |---|---|---|
 | **Save to Margin** | URLs | your Margin server (recommended) |
 | **Save PDF to Margin** | PDF files | your Margin server (recommended) |
-| **Save to Margin (no server)** | URLs | Mathpix API directly — see appendix |
 | **Save PDF to Margin (no server)** | PDF files | Mathpix API directly — see appendix |
 
 The server shortcuts are thin clients: they POST the URL or file to Margin and
 show a notification with the result. All conversion logic stays server-side.
-The "no server" variants in the appendix call the Mathpix API straight from
-iOS and are only worth building if you can't run the server at all.
+The "no server" variant in the appendix calls the Mathpix API straight from
+iOS and is only worth building if you can't run the server at all; it exists
+for PDFs only, because there is no Mathpix call that turns a web page into
+Markdown.
 
 ---
 
 ## Prerequisites
 
 - The Margin server is running and reachable:
-  - **Ubuntu**: `systemctl status margin` on the server
+  - **Ubuntu**: `systemctl status margin@<user>` on the server — the unit is
+    a template, one instance per person, as `deploy/add-instance.sh` sets up
   - **macOS**: started via `bash start.sh` or its Launch Agent
   - From any machine: `curl http://SERVER_ADDRESS:8000/health` returns JSON
 - Find the server address to put into the shortcuts:
@@ -189,8 +191,8 @@ The server returned something other than JSON (an error page, or no response).
 Check the server logs:
 
 ```bash
-journalctl -u margin -n 30        # Ubuntu (systemd)
-tail -30 server.log               # macOS (in the app directory, when launchd-run)
+journalctl -u margin@<user> -n 30   # Ubuntu (systemd, one unit per person)
+tail -30 server.log                 # macOS (in the app directory, when launchd-run)
 ```
 
 Also verify the server is running:
@@ -206,87 +208,40 @@ the notification — it will show the exact request the server got. Swap back to
 
 ---
 
-## Appendix — standalone shortcuts (no server, Mathpix direct)
+## Appendix — a standalone PDF shortcut (no server, Mathpix direct)
 
-These call the Mathpix API directly from iOS and write the result to iCloud
-Drive; no Margin server involved. They exist as a fallback and are weaker than
-the server pipeline (OCR-based URL conversion, 100 s PDF timeout). Credentials
-are stored as plain text inside the shortcut — do not share the shortcut file.
+This calls the Mathpix API directly from iOS and writes the result to iCloud
+Drive; no Margin server involved. It is a fallback for PDFs and is weaker than
+the server pipeline: a 100 s polling ceiling, and none of the title handling,
+front matter or duplicate detection. Credentials are stored as plain text
+inside the shortcut — do not share the shortcut file.
 
-### Shared credential variables (add these at the top of both shortcuts)
+### Credential variables (add these at the top of the shortcut)
 
 1. **Add Action** → **Text** → paste your Mathpix `app_id` → tap the result
    variable name and rename it `MX_ID`.
 2. **Add Action** → **Text** → paste your Mathpix `app_key` → rename result `MX_KEY`.
-3. **Add Action** → **Text** → type `ReadLater/inbox` → rename result `INBOX_FOLDER`.
 
-### "Save to Margin (no server)" — URLs
+### URLs, without a server — there is no such shortcut
 
-Share Sheet Types: **URLs only**
+There is no Mathpix-only path from a web page to Markdown, so this appendix
+has nothing for URLs. Mathpix's `POST /v3/text` reads an *image*: `src` takes
+an image URL or a base64 data URI, and the formats it returns are `text`
+(which is Mathpix Markdown), `html`, `data` and `latex_styled` — there is no
+`mmd` ([Process Images][mx-text]). Handing it a page's HTML and reading an
+`mmd` key back is a call that cannot succeed.
 
-After the three credential actions:
+Fetching the article, finding the content inside the page and turning MathJax
+into LaTeX is the server's own pipeline, and Shortcuts cannot stand in for
+it. For URLs, use "Save to Margin" above.
 
-4. **Add Action** → **Get Contents of URL**
-   - URL: **Shortcut Input**
-   - Method: **GET**
-   - Rename result: `PAGE_HTML`
-
-5. **Add Action** → **Get Contents of URL** *(second action — calls Mathpix)*
-   - URL: `https://api.mathpix.com/v3/text`
-   - Method: **POST**
-   - **Headers** section — add three fields:
-     - Key `app_id` → Value **MX_ID**
-     - Key `app_key` → Value **MX_KEY**
-     - Key `Accept` → Value `application/json`
-   - **Body** section — set type to **JSON**, add fields:
-     - Key `src` → Value **PAGE_HTML**
-     - Key `formats` → Value `["mmd"]`
-     - Key `math_inline_delimiters` → Value `["$","$"]`
-     - Key `math_display_delimiters` → Value `["$$","$$"]`
-   - Rename result: `MX_RESPONSE`
-
-6. **Add Action** → **Get Dictionary from Input** → Input: **MX_RESPONSE** →
-   rename result `MX_DICT`
-
-7. **Add Action** → **Get Dictionary Value**
-   - Key: `mmd`
-   - Dictionary: **MX_DICT**
-   - Rename result: `MD_BODY`
-
-8. **Add Action** → **Format Date**
-   - Date: **Current Date**
-   - Format: **Custom** → `yyyy-MM-dd`
-   - Rename result: `TODAY`
-
-9. **Add Action** → **Text** → enter exactly:
-   ```
-   ---
-   source_url: [Shortcut Input]
-   date_saved: [TODAY]
-   tags: [readlater, math]
-   ---
-
-   [MD_BODY]
-   ```
-   Tap each `[placeholder]` and replace it with the matching variable.
-   Rename result: `FILE_CONTENT`
-
-10. **Add Action** → **Save File**
-    - Storage: **iCloud Drive**
-    - Tap the path field → navigate to **ReadLater/inbox** (create it if it does
-      not exist)
-    - File name: tap the field → **TODAY** + `-article.md`
-    - Ask where to save: **Off**
-
-11. **Add Action** → **Show Notification** → Body: `Saved to iCloud Drive`
-
-12. Tap **Done**.
+[mx-text]: https://docs.mathpix.com/reference/post-v3-text
 
 ### "Save PDF to Margin (no server)" — PDFs
 
 Share Sheet Types: **PDFs only**
 
-After the three credential actions:
+After the two credential actions:
 
 4. **Add Action** → **Get Contents of URL** *(upload PDF to Mathpix)*
    - URL: `https://api.mathpix.com/v3/pdf`
@@ -298,7 +253,10 @@ After the three credential actions:
    - **Body** section — set type to **Form**, add two fields:
      - Type **File**, Key `file` → Value **Shortcut Input**
      - Type **Text**, Key `options_json` → Value:
-       `{"conversion_formats":{"mmd":true},"math_inline_delimiters":["$","$"],"math_display_delimiters":["$$","$$"]}`
+       `{"math_inline_delimiters":["$","$"],"math_display_delimiters":["$$","$$"],"rm_spaces":true}`
+       — the same options the server sends. `.mmd` is produced for every
+       upload, so there is no conversion to ask for; `conversion_formats` is
+       for the extra outputs (DOCX, `tex.zip`) this shortcut does not want.
    - Rename result: `UPLOAD_RESP`
 
 5. **Add Action** → **Get Dictionary from Input** → Input: **UPLOAD_RESP** →
@@ -375,8 +333,14 @@ After the three credential actions:
 | Endpoint | Method | Body | Returns |
 |---|---|---|---|
 | `POST /save` | POST | JSON `{"url":"…"}` (formats optional, default `pdf,md,tex`) | `{"status":"ok","files":[…],"summary":"..."}` |
-| `POST /save-url` | POST | JSON `{"url":"https://..."}` (Markdown only, legacy) | `{"status":"ok","files":[…],"summary":"..."}` |
+| `POST /save-url` | POST | JSON `{"url":"https://..."}` (Markdown only, legacy; refuses when `DEFAULT_FORMATS` names no text format) | `{"status":"ok","files":[…],"summary":"..."}` |
 | `POST /save-pdf` | POST | multipart form, field `file` (keeps PDF + OCRs to md/tex) | `{"status":"ok","files":[…],"summary":"..."}` |
 | `GET /save-page` | GET | query `?url=…&formats=pdf,md` | HTML result page (desktop bookmarklet) |
 | `POST /echo` | POST | anything | mirrors back headers + body |
 | `GET /health` | GET | — | server status + config check |
+
+Every row answers HTTP 200 once the request reaches its handler, with the
+outcome in `status`. Before that it can still be refused outright: 401
+without the token, 403 for a cross-site write, 413 for an upload over the
+cap. Those carry the same JSON shape, so the `summary` step in the shortcuts
+above shows the reason either way.

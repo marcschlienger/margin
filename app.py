@@ -23,6 +23,7 @@ Output directory: --output-dir flag > OUTPUT_DIR env var > platform default.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import ipaddress
 import json
@@ -118,9 +119,20 @@ def _parse_default_formats(raw: str) -> tuple[str, ...]:
 DEFAULT_FORMATS = _parse_default_formats(
     os.getenv("DEFAULT_FORMATS", "pdf,md,tex")
 )
-# Text-only slice of the default, for the Markdown-only endpoints (/save-url,
-# /save-pdf) which can't emit a PDF.
-_DEFAULT_MD_FORMATS = tuple(f for f in DEFAULT_FORMATS if f in MD_FORMATS) or ("md",)
+def _text_formats(formats: tuple[str, ...]) -> tuple[str, ...]:
+    """The text-only slice of a format list, for the steps that write text
+    and cannot write a PDF: /save-url's whole job, and /save-pdf's OCR.
+
+    It is empty when nothing text was asked for, and that emptiness is
+    honoured rather than papered over with a Markdown fallback: /save-pdf
+    keeps the uploaded file and skips the OCR, and /save-url — which has
+    nothing else it could write — says so instead of producing a format the
+    operator excluded.
+    """
+    return tuple(f for f in formats if f in MD_FORMATS)
+
+
+_DEFAULT_MD_FORMATS = _text_formats(DEFAULT_FORMATS)
 
 
 def _default_output_dir() -> Path:
@@ -986,8 +998,13 @@ def _preserve_sub_sup(soup: BeautifulSoup) -> None:
 # from the prose-wrapping pass below.
 _RE_MATH_SPAN = re.compile(r"\$\$.*?\$\$|(?<!\$)\$(?!\$)[^$\n]+\$", re.DOTALL)
 # Code fences and inline spans, so math can be looked for outside them.
-_RE_FENCED_CODE = re.compile(r"^(?P<fence>```+|~~~+).*?^(?P=fence)[ \t]*$",
-                             re.MULTILINE | re.DOTALL)
+# CommonMark, to the extent it matters here: a fence may be indented up to
+# three spaces, and one that is never closed runs to the end of the document.
+# Indented (four-space) code blocks are not stripped, and do not need to be —
+# extraction emits fences for every <pre>, measured on a shell article.
+_RE_FENCED_CODE = re.compile(
+    r"^ {0,3}(?P<fence>```+|~~~+).*?(?:^ {0,3}(?P=fence)[ \t]*$|\Z)",
+    re.MULTILINE | re.DOTALL)
 _RE_INLINE_CODE = re.compile(r"`+[^`\n]*`+")
 
 
@@ -1492,6 +1509,11 @@ _THIN_BODY_CHARS = 200
 
 # Cap for PDFs downloaded from a URL (uploads have their own MAX_PDF_BYTES).
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+# HTML is read into a string and then parsed, so the page costs several times
+# its own size: measured, a 200 MiB body peaked at 1001.1 MiB before anything
+# was written. An article is tens of kilobytes and the largest page worth
+# extracting from is a few megabytes, so this is generous and still bounded.
+MAX_HTML_BYTES = 8 * 1024 * 1024
 
 
 def _looks_like_pdf(data: bytes) -> bool:
@@ -1519,15 +1541,68 @@ def _inflate(data: bytes, encoding: str, limit: int) -> bytes | None:
     return None
 
 
+async def _fetch_html(client: httpx.AsyncClient, url: str) -> str:
+    """The page at `url` as text, refusing to read more than MAX_HTML_BYTES.
+
+    `client.get(...).text` reads whatever the server sends, and how much that
+    is belongs to the server. Read the wire raw under a bound and expand any
+    coding under the same one, as the PDF path does — decoding first would
+    put the size back in the sender's hands.
+    """
+    async with client.stream(
+            "GET", url,
+            headers={"Accept-Encoding": "identity, gzip, deflate"}) as resp:
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "")
+        encoding = resp.headers.get("content-encoding", "").strip().lower()
+        chunks, size = [], 0
+        async for chunk in resp.aiter_raw():
+            size += len(chunk)
+            if size > MAX_HTML_BYTES:
+                raise _PageTooLarge(
+                    f"{url} sent more than "
+                    f"{MAX_HTML_BYTES // 2**20} MB of HTML")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    if encoding and encoding != "identity":
+        expanded = _inflate(raw, encoding, MAX_HTML_BYTES + 1)
+        if expanded is None:
+            raise _PageTooLarge(f"{url} answered in a content coding "
+                                f"({encoding}) this server did not ask for")
+        if len(expanded) > MAX_HTML_BYTES:
+            raise _PageTooLarge(
+                f"{url} sent more than {MAX_HTML_BYTES // 2**20} MB of HTML "
+                "once decompressed")
+        raw = expanded
+    # httpx picks the charset from the header and the body the same way
+    # Response.text does; handing it the bytes keeps that judgement intact.
+    return httpx.Response(200, headers={"content-type": content_type},
+                          content=raw).text
+
+
+class _PageTooLarge(Exception):
+    """A page that will not be read, with the reason a client can be told."""
+
+
 async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
     """Return the raw bytes if `url` serves a PDF directly, else None."""
-    ctype = ""
+    ctype, answered = "", False
     try:
         head = await client.head(url)
-        ctype = head.headers.get("content-type", "").lower()
+        # 405 and 403 are how servers say "not this method", not "not a PDF".
+        if head.status_code < 400:
+            ctype = head.headers.get("content-type", "").lower()
+            answered = True
     except httpx.HTTPError:
-        pass  # many servers reject HEAD — fall back to the extension check
-    if "application/pdf" not in ctype and not urlparse(url).path.lower().endswith(".pdf"):
+        pass  # many servers reject HEAD outright — the GET can still answer
+    looks_pdf = ("application/pdf" in ctype
+                 or urlparse(url).path.lower().endswith(".pdf"))
+    # A URL with no .pdf used to end it here whenever HEAD had not said
+    # otherwise — including when HEAD had failed and said nothing at all, so
+    # an extensionless PDF behind a HEAD-hostile server was never recognised
+    # and its GET's content type never looked at. Give up early only when
+    # HEAD answered and named something else.
+    if not looks_pdf and answered:
         return None
     try:
         # A PDF is already compressed, so a content coding on top of one buys
@@ -1694,6 +1769,18 @@ def _files_for_stems(stems: set[str]) -> list[Path]:
     return files
 
 
+def _covers_formats(existing: dict, formats: tuple[str, ...]) -> bool:
+    """Whether an earlier save already produced every format now asked for.
+
+    "Already saved" used to mean "some file exists for this URL", so a
+    capture whose Mathpix step had failed could never be completed: asking
+    for the missing Markdown was answered with the PDF that was already
+    there, and --force was the only way through.
+    """
+    have = {Path(name).suffix.lstrip(".").lower() for name in existing["files"]}
+    return set(formats).issubset(have)
+
+
 def _find_existing(url: str) -> dict | None:
     """Return {'files', 'title'} for a still-present earlier save of `url`."""
     norm = _norm_url(url)
@@ -1720,6 +1807,26 @@ def _find_existing(url: str) -> dict | None:
         files[0].stem
     )
     return {"files": [f.name for f in files], "title": title}
+
+
+# URLs being captured right now. The duplicate check runs before any file
+# exists, so two requests for one URL both passed it and both rendered the
+# page and spent Mathpix credits on it.
+_in_flight: set = set()
+
+
+@contextlib.asynccontextmanager
+async def _reserve_url(url: str):
+    """Hold a URL for the length of one capture; yields False if it is taken."""
+    key = _norm_url(url)
+    if key in _in_flight:
+        yield False
+        return
+    _in_flight.add(key)
+    try:
+        yield True
+    finally:
+        _in_flight.discard(key)
 
 
 def _duplicate_response(existing: dict) -> dict:
@@ -1777,21 +1884,34 @@ async def _direct_pdf_title(client: httpx.AsyncClient, url: str,
             or "document")
 
 
+def _no_text_format_error() -> dict:
+    """The one refusal DEFAULT_FORMATS can produce, in words that name the fix."""
+    return _err(
+        f"DEFAULT_FORMATS is {','.join(DEFAULT_FORMATS)}, which asks for no "
+        "text format, and this endpoint writes text and nothing else. "
+        'POST /save with {"formats": ["pdf"]} to capture a page instead, or '
+        "add md, tex or org to DEFAULT_FORMATS.")
+
+
 async def _run_markdown_save(
     url: str, request: Request, formats: tuple[str, ...] = _DEFAULT_MD_FORMATS,
     preferred_stem: str | None = None,
 ) -> dict:
     """Markdown pipeline: fetch, extract content + math, write the requested
     subset of .md/.tex/.org."""
+    if not formats:
+        return _no_text_format_error()
     _log("save-url", f"fetching {url}")
     client: httpx.AsyncClient = request.app.state.client
     renderer: Renderer = request.app.state.renderer
 
     html, fetch_err, retry_render = None, "", True
     try:
-        page = await client.get(url)
-        page.raise_for_status()
-        html = page.text
+        html = await _fetch_html(client, url)
+    except _PageTooLarge as e:
+        # Not a bot wall and not a thin page: rendering it in Chromium would
+        # read the same bytes again, with a browser on top.
+        fetch_err, retry_render = str(e), False
     except httpx.HTTPStatusError as e:
         code = e.response.status_code
         fetch_err = f"Site returned {code}: {url}"
@@ -1801,13 +1921,24 @@ async def _run_markdown_save(
     except httpx.RequestError as e:
         fetch_err = f"Could not reach {url}: {e}"
 
-    title, body = "", ""
+    title, body, challenged = "", "", ""
     if html is not None:
         try:
             title, body = _extract_url_content(html, url)
         except Exception as e:
             _log("save-url", f"extract failed: {e}\n{traceback.format_exc()}")
             return _err(f"Extraction failed: {e}")
+        # A bot wall can answer 200 with a page long enough to look like an
+        # article — "Just a moment…" plus a paragraph of explanation
+        # extracts as ~2000 characters. The status and the length both say
+        # yes; only the title says what it is, and looks_blocked already
+        # knows. Treat it as no content, which is what it is, so the render
+        # retry below gets its turn.
+        if looks_blocked(title):
+            _log("save-url", f"challenge page from plain fetch: {title!r}")
+            challenged = title
+            title, body = "", ""
+            retry_render = True
 
     # Plain fetch blocked or page is client-side rendered → retry in headless
     # Chromium, which executes the JS before we extract.
@@ -1829,6 +1960,11 @@ async def _run_markdown_save(
         except Exception as e:
             _log("save-url", f"render fallback failed: {e}")
 
+    if looks_blocked(title) or (challenged and not body.strip()):
+        seen = title or challenged
+        return _err(f"{url} answered with a bot-check page, not an article "
+                    f"({seen!r}) — try POST /save with "
+                    '{"formats": ["pdf"]} once you can reach it in a browser')
     if not body.strip():
         return _err(
             fetch_err
@@ -1870,11 +2006,16 @@ async def _run_markdown_save(
 @app.post("/save-url")
 async def save_url(payload: URLPayload, request: Request):
     """Fetch a web page, extract content + math, save Markdown to the output dir."""
+    if not _DEFAULT_MD_FORMATS:
+        return _no_text_format_error()
     existing = _find_existing(payload.url)
-    if existing:
+    if existing and _covers_formats(existing, _DEFAULT_MD_FORMATS):
         _log("save-url", f"duplicate of {existing['files'][0]}: {payload.url}")
         return _duplicate_response(existing)
-    return await _run_markdown_save(payload.url, request)
+    async with _reserve_url(payload.url) as reserved:
+        if not reserved:
+            return _err(f"Already saving {payload.url} — try again in a moment")
+        return await _run_markdown_save(payload.url, request)
 
 
 def _mathpix_missing_warning(md_formats: tuple[str, ...]) -> str:
@@ -1885,6 +2026,14 @@ def _mathpix_missing_warning(md_formats: tuple[str, ...]) -> str:
 
 @app.post("/save")
 async def save(payload: SavePayload, request: Request):
+    """One capture of a URL at a time; the work is in _save_reserved."""
+    async with _reserve_url(payload.url) as reserved:
+        if not reserved:
+            return _err(f"Already saving {payload.url} — try again in a moment")
+        return await _save_reserved(payload, request)
+
+
+async def _save_reserved(payload: SavePayload, request: Request):
     """Save any page into the requested formats (default: DEFAULT_FORMATS).
 
     A web page → PDF via headless Chromium + Markdown via the HTML pipeline.
@@ -1898,7 +2047,7 @@ async def save(payload: SavePayload, request: Request):
 
     if not payload.force:
         existing = _find_existing(payload.url)
-        if existing:
+        if existing and _covers_formats(existing, payload.formats):
             _log("save", f"duplicate of {existing['files'][0]}: {payload.url}")
             return _duplicate_response(existing)
 
@@ -2352,10 +2501,16 @@ document.querySelectorAll('time[datetime]').forEach(function (el) {
     const picked = saved.split(',');
     boxes.forEach(b => { b.checked = picked.includes(b.value); });
   }
+  // An empty form field is simply absent from a GET, and /save-page falls
+  // back to DEFAULT_FORMATS rather than saving nothing. Saying "none" was a
+  // lie about a save that was about to happen anyway.
+  const fallback = boxes.filter(b => b.dataset.default !== undefined)
+                        .map(b => NAMES[b.value]).join(', ');
   function update() {
     const picked = boxes.filter(b => b.checked).map(b => b.value);
     document.getElementById('fmt-summary').textContent =
-      picked.length ? picked.map(v => NAMES[v]).join(', ') : 'none';
+      picked.length ? picked.map(v => NAMES[v]).join(', ')
+                    : 'server default — ' + fallback;
     try { localStorage.setItem('margin-formats', picked.join(',')); }
     catch (e) { /* nothing to remember it with */ }
   }
@@ -2388,11 +2543,17 @@ _FORMAT_LABELS = [
 
 
 def _format_checkboxes() -> str:
+    """Boxes for the quick-save form, pre-checked to match DEFAULT_FORMATS.
+
+    data-default marks the same set for the script: clearing every box does
+    not save nothing, it saves the server default, and the summary line has
+    to be able to say which formats those are.
+    """
     rows = []
     for val, name, desc in _FORMAT_LABELS:
-        checked = " checked" if val in DEFAULT_FORMATS else ""
+        default = ' data-default checked' if val in DEFAULT_FORMATS else ''
         rows.append(
-            f'<label><input type="checkbox" name="formats" value="{val}"{checked}> '
+            f'<label><input type="checkbox" name="formats" value="{val}"{default}> '
             f'{name} <small>— {desc}</small></label>'
         )
     return "\n      ".join(rows)
@@ -2932,9 +3093,32 @@ async def archive(stem: str = Form(...), action: str = Form("archive")):
         if files:
             formats = tuple(f.suffix.lstrip(".").lower() for f in files)
             target = _family_path(dst / f"{stem}.md", formats)
-            for f in files:
-                f.rename(dst / f"{target.stem}{f.suffix.lower()}")
-                moved += 1
+            # One item is several files, and a rename can fail part way — a
+            # full disk, a permission, the sync client holding one open. A
+            # bare loop leaves the item split across both folders, listed in
+            # neither view completely. Put back what moved, and if even that
+            # fails, say exactly where the pieces are.
+            done: list[tuple[Path, Path]] = []
+            try:
+                for f in files:
+                    landed = dst / f"{target.stem}{f.suffix.lower()}"
+                    f.rename(landed)
+                    done.append((f, landed))
+            except OSError as e:
+                stranded = []
+                for was, now in reversed(done):
+                    try:
+                        now.rename(was)
+                    except OSError:
+                        stranded.append(now.name)
+                _log("archive", f"{action} {stem} failed after "
+                                f"{len(done)} of {len(files)}: {e}")
+                detail = f"Could not {action} {stem}: {e}"
+                if stranded:
+                    detail += ("; these are now in the other folder and were "
+                               "not put back: " + ", ".join(sorted(stranded)))
+                raise HTTPException(500, detail=detail) from e
+            moved = len(done)
             # The destination may already hold that name, in which case the
             # family lands on "<stem>-2" — and the URL index still pointed at
             # "<stem>", which by then is a different item's files. A PDF-only
@@ -2963,7 +3147,13 @@ async def health(request: Request):
         "saved_md_count": len(list(OUTPUT_DIR.glob("*.md"))) if exists else 0,
         "saved_pdf_count": len(list(OUTPUT_DIR.glob("*.pdf"))) if exists else 0,
         "pandoc_available": shutil.which("pandoc") is not None,
+        # Two facts, because they come apart: pip installs the package and
+        # `playwright install chromium` installs the browser. With only the
+        # first, this reported a working renderer while every PDF save
+        # failed on launch.
         "playwright_available": request.app.state.renderer.available,
+        "chromium_installed":
+            await request.app.state.renderer.chromium_installed(),
         "mathpix_configured": bool(MATHPIX_APP_ID and MATHPIX_APP_KEY),
         "auth_required": bool(MARGIN_TOKEN),
     }

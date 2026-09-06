@@ -57,9 +57,14 @@ documented in detail in [description.md](description.md).
 
 ## API
 
-All save endpoints respond with HTTP 200 and a JSON body containing
-`"status": "ok"` or `"status": "error"` — errors are in-band so that iOS
-Shortcuts can display the message instead of failing silently.
+A save that reaches its handler answers HTTP 200 with a JSON body containing
+`"status": "ok"` or `"status": "error"` — a failed save is in-band, so iOS
+Shortcuts can display the message instead of failing silently. A request
+turned away before the handler carries its own status: 401 without the token,
+403 for a cross-site write, 413 for a body over the cap. Those three answer
+the same JSON shape, so a client reading `summary` has something to show
+either way; a payload that does not parse is the exception, answering 422
+with FastAPI's `{"detail": …}`.
 
 If `MARGIN_TOKEN` is set, every endpoint below except `GET /health` also
 requires the token (`Authorization: Bearer <token>` header, `?token=`
@@ -129,8 +134,15 @@ extracts the article with math converted to LaTeX, and writes the text-format
 slice of the default (shipping as `md` + `tex`; Pandoc-derived, skipped if
 Pandoc is absent). If the plain fetch is bot-blocked (401/403/406/429/503) or
 the extracted body is nearly empty (client-side-rendered app), it
-automatically retries from the fully rendered Chromium DOM. Responds with
-`{"status": "ok", "filename": …, "files": […], "title": …, "summary": …}`.
+automatically retries from the fully rendered Chromium DOM. A page that is
+still a bot-check after that retry is refused rather than filed: a challenge
+page is long enough to pass for an article, and only its title gives it away.
+Responds with `{"status": "ok", "filename": …, "files": […], "title": …,
+"summary": …}`.
+
+Set `DEFAULT_FORMATS` to PDF alone and this endpoint has nothing it can
+write, so it refuses and says so, naming `POST /save` — it does not quietly
+fall back to Markdown, which would produce exactly the format you excluded.
 
 Prefer `POST /save` for new integrations — it's the unified endpoint that can
 also produce the PDF. `/save-url` remains for the pure-text use case.
@@ -146,7 +158,9 @@ to the default text formats via the [Mathpix](https://mathpix.com) `/v3/pdf`
 API (polls up to 3 minutes) — best-in-class for math PDFs. Needs
 `MATHPIX_APP_ID`/`MATHPIX_APP_KEY`; without them the PDF is still saved and
 the OCR step is skipped with a warning. So an uploaded PDF yields the same
-PDF + Markdown + LaTeX as a URL save.
+PDF + Markdown + LaTeX as a URL save. With `DEFAULT_FORMATS` naming no text
+format the OCR is skipped too, and no Mathpix credit is spent on text you
+said you did not want.
 
 ### `GET /` — built-in reading queue
 
@@ -190,11 +204,20 @@ be opened as a browser tab by the desktop bookmarklet (see below).
 ### `GET /health`
 
 ```json
-{ "status": "ok", "output_dir": "…", "output_dir_exists": true,
-  "output_dir_writable": true, "saved_md_count": 12, "saved_pdf_count": 34,
-  "pandoc_available": true, "playwright_available": true,
-  "mathpix_configured": false }
+{ "status": "ok", "output_dir_exists": true, "output_dir_writable": true,
+  "saved_md_count": 12, "saved_pdf_count": 34, "pandoc_available": true,
+  "playwright_available": true, "chromium_installed": true,
+  "mathpix_configured": false, "auth_required": false }
 ```
+
+The output directory's path is not in there: `/health` is the one endpoint a
+token does not gate, and on a real install the path names the account the
+service runs as. Whether it exists and is writable is the useful half.
+
+`playwright_available` and `chromium_installed` are two different facts. `pip
+install playwright` gives you the first; `playwright install chromium` gives
+you the second, and PDF rendering needs both — with only the package, every
+render fails at launch.
 
 ### `POST /echo`
 
@@ -228,11 +251,18 @@ Debug helper: echoes method, headers, and parsed body of the request back.
 |---|---|---|
 | Output directory | `--output-dir` flag > `OUTPUT_DIR` env var (both also read from `.env`) | iCloud `ReadLater/inbox` on macOS, `~/ReadLater/inbox` elsewhere |
 | Bind address / port | `--host` / `--port` flags, or `HOST` / `PORT` env vars | `0.0.0.0` / `8000` |
-| Default formats | `DEFAULT_FORMATS` in `.env` (subset of `pdf,md,tex,org`; an invalid value stops startup) | `pdf,md,tex` |
+| Default formats | `DEFAULT_FORMATS` in `.env` (subset of `pdf,md,tex,org`; an invalid value stops startup; naming no text format leaves `/save-url` nothing to write, and it says so) | `pdf,md,tex` |
 | Mathpix credentials | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` in `.env` | unset — PDFs are kept, but PDF-to-text OCR is skipped |
 | API token | `MARGIN_TOKEN` in `.env` | unset — no authentication |
 | Cross-origin access | `MARGIN_CORS_ORIGINS` in `.env` (comma-separated origins) | unset — no cross-origin access |
 | Saves to private addresses | `MARGIN_ALLOW_PRIVATE_URLS` in `.env` | unset — loopback, LAN and metadata addresses refused |
+
+Three limits are fixed in the source rather than configured, because the
+numbers only matter when something has gone wrong: an upload is at most
+50 MB, a downloaded PDF at most 100 MB, and a page's HTML at most 8 MB. The
+last one is smaller than it sounds — an article is tens of kilobytes, and
+the text is parsed as well as held, so a body costs several times its own
+size while it is being read.
 
 ## Authentication (optional)
 
@@ -255,9 +285,9 @@ Clients can present the token three ways:
 - **Browser cookie** — open `http://YOUR-SERVER:8000/?token=<token>` once and
   the token is stored in an `HttpOnly`, `SameSite=Strict` cookie (1 year);
   after that the queue UI, file links, and archive buttons work with no
-  decoration. Because the cookie is `Strict`, other websites can never ride
-  it — enabling the token also closes the drive-by CSRF window that an open
-  LAN server inherently has.
+  decoration. `Strict` keeps other *sites* from riding it; a page served from
+  the same site — the same host on another port — still gets it, which is why
+  the cross-site guard below is not the whole story.
 
 With a token set, the bookmarklet becomes:
 
@@ -286,7 +316,7 @@ changes or resolves to an internal address remains outside this guarantee.
 Set `MARGIN_ALLOW_PRIVATE_URLS=1` if you save from an internal wiki and want
 it back.
 
-**A page you are visiting cannot change anything here.** A plain HTML form
+**A page on another site cannot change anything here.** A plain HTML form
 posts cross-origin without a preflight and the browser sends it whether or
 not the answer can be read, so with `MARGIN_TOKEN` unset — the private-network
 default — any site could have archived, restored or deleted your saved items.
@@ -296,6 +326,32 @@ state-changing exception, and is accepted cross-site only as a top-level
 document navigation—not as an image, iframe, script or background request.
 `curl`, the iOS Shortcut and RSS readers send no such header and are
 unaffected.
+
+Three things that guard deliberately does not cover, because "another site"
+is narrower than "another origin":
+
+- **The same site on another port.** A *site* is the scheme plus the
+  registrable domain; the port is not part of it ([HTML][site-def]), so a
+  second service on the same machine — `http://your-server:9000` next to
+  Margin on `:8000` — is same-site, and a page it serves can post here. The
+  `SameSite=Strict` cookie is attached to those requests too. On a tailnet
+  the registrable domain is your tailnet (`ts.net` is a public suffix), so
+  another machine of yours is same-site and another tailnet is not.
+- **An origin you listed in `MARGIN_CORS_ORIGINS`.** That setting exists to
+  let a browser extension post, so its origins skip the guard. Keep it empty
+  unless you are running one.
+- **A browser too old to send `Sec-Fetch-Site`.** The header is the whole
+  mechanism; a client that omits it is treated as not-a-browser, which is
+  what makes `curl` and the Shortcut work.
+
+`MARGIN_TOKEN` closes the first gap only for clients that have to *supply*
+the token — the header and the `?token=` form. It does not close it for the
+browser you read in: the cookie is `SameSite=Strict`, and Strict is about the
+site, so a same-site page's request carries the cookie just as your own tabs
+do. What actually covers that case is not serving untrusted pages from the
+machine or the tailnet Margin runs on.
+
+[site-def]: https://html.spec.whatwg.org/multipage/browsers.html#site
 
 ## Remote access via Tailscale
 
@@ -410,6 +466,120 @@ special-casing, no port forwarding, no dynamic DNS.
 The iOS Shortcuts, the bookmarklet, and `curl` all work unchanged over
 Tailscale — only the address (and with `tailscale serve`, the scheme)
 changes.
+
+## Behind a reverse proxy (Caddy)
+
+If a proxy already terminates TLS for other services on this machine, that is
+the tidier home for Margin too: one thing owns certificates and renewal, the
+config sits in a file beside everything else's, and each app gets a hostname
+you chose instead of a port number.
+
+**None of this has to be public.** Point the DNS record at the server's
+*tailnet* address rather than its public one:
+
+```
+margin.example.com.    A    100.101.102.103      # tailscale ip -4
+```
+
+The name then resolves for anyone and connects for nobody outside the
+tailnet. `100.64.0.0/10` is the Shared Address Space of
+[RFC 6598][rfc6598] — reserved for carrier-grade NAT, which is to say for
+traffic that needs another layer of translation before it reaches the
+internet, and which nothing routes across it. Tailscale hands its node
+addresses out of that range for exactly that reason; `tailscale ip` prints
+yours, one from it and one from Tailscale's IPv6 ULA prefix. You get
+the ordinary reverse-proxy arrangement without putting a headless browser
+that fetches arbitrary URLs on the open web.
+
+The one thing that follows: Let's Encrypt cannot reach that address either,
+so the certificate has to come from a **DNS-01 challenge**, which needs a DNS
+provider plugin.
+
+```bash
+sudo caddy add-package github.com/caddy-dns/cloudflare   # your provider
+sudo systemctl restart caddy
+```
+
+`add-package` is marked experimental and replaces the binary in place, so a
+later `apt upgrade caddy` puts the stock one back and certificates stop
+renewing. Pin the package, or build with `xcaddy` and install outside apt's
+reach.
+
+```caddyfile
+margin.example.com {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	# A backstop, not the mechanism: if that A record is ever changed to a
+	# public address, this turns the mistake into a 403 rather than an
+	# exposure. remote_ip matches the immediate peer, which over Tailscale
+	# is the 100.x address, and Caddy's directive order puts respond ahead
+	# of reverse_proxy, so the refusal happens before the proxy sees it.
+	# Both families: a node has a v4 and a v6 tailnet address, and a
+	# request arriving over the v6 one would fail a v4-only match.
+	# It is a backstop and not a wall: the same range is what ISPs put
+	# their own CGNAT customers behind, so a public record plus this
+	# matcher would still admit some of them.
+	@outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
+	respond @outside 403
+	reverse_proxy 127.0.0.1:8000
+}
+```
+
+Three Caddy defaults are already what Margin needs, so there is nothing to
+tune:
+
+- It "sets the `X-Forwarded-Proto` header field"
+  ([reverse_proxy][caddy-rp]) — which is exactly what the auth cookie reads
+  to decide it may carry `Secure`.
+- There is no default request-body limit (`request_body max_size` is opt-in),
+  so 50 MB PDF uploads pass through untouched.
+- `response_header_timeout` defaults to "No timeout", so a page that takes
+  the full 60-second render deadline is not cut off mid-capture.
+
+Then bind Margin to loopback, or the plain-HTTP port stays open on the
+tailnet alongside the HTTPS name — two origins for one app, only one of which
+reads offline:
+
+```bash
+# /etc/margin/<user>.env
+HOST=127.0.0.1
+sudo systemctl restart margin@<user>
+ss -ltnp | grep 8000        # expect 127.0.0.1:8000, not 0.0.0.0:8000
+```
+
+**A consequence of sharing a domain.** The cross-site guard refuses writes
+the browser marks `cross-site`, and "site" means the registrable domain — so
+`margin.example.com` and any other service you host under `example.com` are
+*same-site*, and a page served by one can post to the other with the
+`SameSite=Strict` cookie attached. That is fine for software you trust; if
+one of those services renders HTML that other people supply, give Margin a
+different registrable domain instead.
+
+**If you point the record at a public address**, you are trading that away:
+what stands between the internet and a browser-as-a-service is one shared
+bearer token with no rate limiting and no lockout. Add a second gate at the
+proxy — `basic_auth`, mTLS, or an IP allowlist — rather than relying on
+`MARGIN_TOKEN` alone.
+
+### Switching an install that is already running
+
+Order matters: prove the new path works before closing the old one.
+
+1. Add the DNS record, add the Caddy block, `caddy validate` and reload.
+2. Watch `journalctl -u caddy -f` for `certificate obtained successfully`.
+3. Open `https://margin.example.com/?token=<token>` on one device. Only when
+   that works, set `HOST=127.0.0.1` and restart the service.
+4. On **every** device: open the URL once with `?token=…`, delete the old
+   home-screen app and re-add it from the new address, and update the iOS
+   Shortcuts and the bookmarklet. A PWA keeps the origin it was installed
+   from, and service workers, caches and cookies are per-origin — the old
+   install will never see the new server.
+5. The old origin's cached pages stay in the browser until its site data is
+   cleared (iOS: Settings → Safari → Advanced → Website Data).
+
+[caddy-rp]: https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+[rfc6598]: https://www.rfc-editor.org/rfc/rfc6598#section-7
 
 ## Install
 
