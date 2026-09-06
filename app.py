@@ -148,6 +148,32 @@ def _default_output_dir() -> Path:
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR") or _default_output_dir()).expanduser()
 
 
+def _warn_about_shared_stems() -> None:
+    """Say so once at startup if two items share a name.
+
+    Allocation spans both folders now, so this can only be the work of an
+    older version — but the files are still there, and until they are renamed
+    one item's URL can resolve to the other's document.
+    """
+    def stems(folder: Path) -> set[str]:
+        if not folder.is_dir():
+            return set()
+        try:
+            return {f.stem for f in folder.iterdir()
+                    if f.is_file() and f.suffix.lower() in _SERVE_EXTS}
+        except OSError:
+            return set()
+
+    shared = stems(OUTPUT_DIR) & stems(_archive_dir())
+    if shared:
+        _log("startup",
+             f"{len(shared)} stem(s) held by both an inbox and an archived "
+             f"item ({', '.join(sorted(shared)[:3])}"
+             f"{', …' if len(shared) > 3 else ''}). One item's URL can "
+             "resolve to the other's file until they are renamed: run "
+             "deploy/unique-stems.py")
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     application.state.client = httpx.AsyncClient(
@@ -160,6 +186,7 @@ async def lifespan(application: FastAPI):
         event_hooks={"request": [_validate_outbound_request]},
     )
     application.state.renderer = Renderer(url_allowed=_browser_url_allowed)
+    _warn_about_shared_stems()
     yield
     await application.state.renderer.close()
     await application.state.client.aclose()
@@ -650,9 +677,32 @@ def _write_text_atomically(path: Path, text: str) -> None:
 _WRITE_LOCK = threading.Lock()
 
 
-def _family_path(path: Path, formats: tuple[str, ...], reuse_stem: bool = False) -> Path:
+def _stem_taken(stem: str, exts: set[str], besides: frozenset = frozenset()) -> bool:
+    """Whether any file of this stem exists in *either* folder.
+
+    Both, because a stem is an item's identity everywhere else in the app —
+    the URL index, the delete and archive forms, the service worker's
+    forget-stem message — and not one of those carries a folder alongside it.
+    Allocating per folder let the inbox and the archive hold two different
+    items under one name, and then archiving one rewrote the other's index
+    entry, so its URL resolved to a document it had nothing to do with.
+
+    `besides` excludes files that are about to move: the family being
+    archived is its own occupant until the rename lands.
+    """
+    for folder in (OUTPUT_DIR, _archive_dir()):
+        for ext in exts:
+            path = folder / f"{stem}{ext}"
+            if path not in besides and path.exists():
+                return True
+    return False
+
+
+def _family_path(path: Path, formats: tuple[str, ...], reuse_stem: bool = False,
+                 besides: frozenset = frozenset()) -> Path:
     """Pick one stem that is free for the whole requested file family.
 
+    Free in both folders, so a stem names one item for as long as it exists.
     Looking only at the Markdown name let a later TeX-only save overwrite an
     existing `.tex`. `reuse_stem` is for adding OCR text beside the PDF this
     same request has just written; requested targets still have to be absent.
@@ -662,10 +712,8 @@ def _family_path(path: Path, formats: tuple[str, ...], reuse_stem: bool = False)
     i = 1
     while True:
         candidate = stem if i == 1 else f"{stem}-{i}"
-        target_exists = any((parent / f"{candidate}{ext}").exists()
-                            for ext in wanted)
-        family_exists = any((parent / f"{candidate}{ext}").exists()
-                            for ext in _SERVE_EXTS)
+        target_exists = _stem_taken(candidate, wanted, besides)
+        family_exists = _stem_taken(candidate, set(_SERVE_EXTS), besides)
         if not target_exists and (reuse_stem or not family_exists):
             return parent / f"{candidate}{path.suffix}"
         i += 1
@@ -1541,6 +1589,14 @@ def _inflate(data: bytes, encoding: str, limit: int) -> bytes | None:
     return None
 
 
+def _too_large(url: str) -> str:
+    """One phrasing for the download cap, in a unit that survives small caps."""
+    cap = MAX_DOWNLOAD_BYTES
+    size = (f"{cap // 2**20} MB" if cap >= 2**20 else
+            f"{cap // 1024} kB" if cap >= 1024 else f"{cap} bytes")
+    return f"The PDF at {url} is larger than the {size} download limit"
+
+
 async def _fetch_html(client: httpx.AsyncClient, url: str) -> str:
     """The page at `url` as text, refusing to read more than MAX_HTML_BYTES.
 
@@ -1580,8 +1636,16 @@ async def _fetch_html(client: httpx.AsyncClient, url: str) -> str:
                           content=raw).text
 
 
-class _PageTooLarge(Exception):
-    """A page that will not be read, with the reason a client can be told."""
+class _TooLarge(Exception):
+    """Something the size limits refused, with a reason a client can be told."""
+
+
+class _PageTooLarge(_TooLarge):
+    """An HTML body over MAX_HTML_BYTES."""
+
+
+class _DownloadTooLarge(_TooLarge):
+    """A direct PDF over MAX_DOWNLOAD_BYTES."""
 
 
 async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
@@ -1623,9 +1687,7 @@ async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
             async for chunk in resp.aiter_raw():
                 size += len(chunk)
                 if size > MAX_DOWNLOAD_BYTES:
-                    raise RuntimeError(
-                        f"PDF at {url} exceeds {MAX_DOWNLOAD_BYTES // 2**20} MB"
-                    )
+                    raise _DownloadTooLarge(_too_large(url))
                 chunks.append(chunk)
             data = b"".join(chunks)
             encoding = resp.headers.get("content-encoding", "").strip().lower()
@@ -1634,27 +1696,28 @@ async def _fetch_pdf_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
             if data is None:
                 return None                 # a coding we did not ask for
             if len(data) > MAX_DOWNLOAD_BYTES:
-                raise RuntimeError(
-                    f"PDF at {url} exceeds {MAX_DOWNLOAD_BYTES // 2**20} MB"
+                raise _DownloadTooLarge(_too_large(url) + " once decompressed"
                 )
         return data if _looks_like_pdf(data) else None
     except httpx.HTTPError:
         return None
 
 
-async def _write_binary_async(filename: str, data: bytes) -> Path:
+async def _write_binary_async(filename: str, data: bytes,
+                              reuse_stem: bool = False) -> Path:
     """Off the loop: a PDF is megabytes, and the write is followed by fsync,
     an atomic replace and a lock. Measured with a 400ms write, an async
     heartbeat stopped entirely — the same reason the multi-format writer was
     moved off the loop."""
-    return await asyncio.to_thread(_write_binary, filename, data)
+    return await asyncio.to_thread(_write_binary, filename, data, reuse_stem)
 
 
-def _write_binary(filename: str, data: bytes) -> Path:
+def _write_binary(filename: str, data: bytes, reuse_stem: bool = False) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with _WRITE_LOCK:
         path = _family_path(OUTPUT_DIR / filename,
-                            (Path(filename).suffix.lstrip("."),))
+                            (Path(filename).suffix.lstrip("."),),
+                            reuse_stem=reuse_stem)
         _write_bytes_atomically(path, data)
     return path
 
@@ -1806,7 +1869,12 @@ def _find_existing(url: str) -> dict | None:
     title = (_read_frontmatter_field(md, "title") if md else None) or _pretty_stem(
         files[0].stem
     )
-    return {"files": [f.name for f in files], "title": title}
+    return {"files": [f.name for f in files], "title": title,
+            "stem": files[0].stem,
+            # Which folder it is in decides whether a missing format can be
+            # added to it: writing into the inbox beside an archived family
+            # would leave one item spread across both.
+            "archived": files[0].parent != OUTPUT_DIR}
 
 
 # URLs being captured right now. The duplicate check runs before any file
@@ -2045,21 +2113,49 @@ async def _save_reserved(payload: SavePayload, request: Request):
     client: httpx.AsyncClient = request.app.state.client
     renderer: Renderer = request.app.state.renderer
 
+    existing = None
     if not payload.force:
         existing = _find_existing(payload.url)
         if existing and _covers_formats(existing, payload.formats):
             _log("save", f"duplicate of {existing['files'][0]}: {payload.url}")
             return _duplicate_response(existing)
 
+    # An earlier save that produced only some of these formats — a capture
+    # whose Mathpix or render step failed — is completed in place. Repeating
+    # the whole set instead allocated a fresh stem for the formats that
+    # already existed, so one URL became two queue entries and the PDF was
+    # written twice.
+    formats = tuple(payload.formats)
+    reuse_stem = None
+    if existing:
+        if existing["archived"]:
+            answer = _duplicate_response(existing)
+            answer["message"] = (
+                f"Already saved and archived ({existing['files'][0]}); "
+                "restore it before adding formats, or send \"force\": true "
+                "to save a second copy")
+            return answer
+        have = {Path(name).suffix.lstrip(".").lower()
+                for name in existing["files"]}
+        formats = tuple(f for f in payload.formats if f not in have)
+        reuse_stem = existing["stem"]
+        _log("save", f"completing {reuse_stem} with {list(formats)}")
+
     saved: list[str] = []
     errors: list[str] = []
     title = ""
-    want_pdf = "pdf" in payload.formats
-    md_formats = tuple(f for f in payload.formats if f in MD_FORMATS)
+    want_pdf = "pdf" in formats
+    md_formats = tuple(f for f in formats if f in MD_FORMATS)
 
     # Probe once: does the URL serve a PDF directly? (One HEAD for web pages.)
     try:
         pdf_bytes = await _fetch_pdf_bytes(client, payload.url)
+    except _DownloadTooLarge as e:
+        # Not "this is not a PDF". Falling through to the web-page branch
+        # handed the same URL to Chromium, which loaded and printed the file
+        # the download limit had just refused — and answered "ok".
+        _log("save", f"refused: {e}")
+        return _err(str(e))
     except Exception as e:
         _log("save", f"direct-pdf probe failed: {e}")
         pdf_bytes = None
@@ -2067,14 +2163,15 @@ async def _save_reserved(payload: SavePayload, request: Request):
     if pdf_bytes is not None:
         # ---- Source is a PDF: store it as-is, OCR it for the text formats ----
         title = _clean_title(await _direct_pdf_title(client, payload.url, pdf_bytes))
-        stem = None
+        stem = reuse_stem
         if want_pdf:
             # Inside the error handling like every other write. Outside it, a
             # full disk or a read-only folder left this branch answering HTTP
             # 500 instead of the JSON error result the API documents.
             try:
-                pdf_path = await _write_binary_async(_filename(title, "pdf"),
-                                                     pdf_bytes)
+                pdf_path = await _write_binary_async(
+                    f"{reuse_stem}.pdf" if reuse_stem else _filename(title, "pdf"),
+                    pdf_bytes, reuse_stem=reuse_stem is not None)
             except OSError as e:
                 _log("save", f"direct-PDF write failed: {e}")
                 return _err(f"Could not write the PDF: {e}")
@@ -2104,7 +2201,7 @@ async def _save_reserved(payload: SavePayload, request: Request):
                 errors.append(f"PDF OCR failed: {e}")
     else:
         # ---- Source is a web page: render for PDF, extract HTML for text ----
-        web_stem = None
+        web_stem = reuse_stem
         if want_pdf:
             try:
                 rendered = await renderer.render(payload.url)
@@ -2119,10 +2216,12 @@ async def _save_reserved(payload: SavePayload, request: Request):
                     )
                 title = _clean_title(rendered.title) or payload.url
                 pdf_path = await _write_binary_async(
-                    _filename(title, "pdf"), rendered.pdf)
+                    f"{reuse_stem}.pdf" if reuse_stem else _filename(title, "pdf"),
+                    rendered.pdf, reuse_stem=reuse_stem is not None)
                 saved.append(pdf_path.name)
                 web_stem = pdf_path.stem
-                _record_url(payload.url, pdf_path.stem)
+                if reuse_stem is None:
+                    _record_url(payload.url, pdf_path.stem)
                 _log("save", f"saved → {pdf_path.name}")
             except RendererUnavailable as e:
                 errors.append(str(e))
@@ -3006,7 +3105,13 @@ async def read_file(name: str):
 
 
 def _rename_stem(old: str, new: str) -> None:
-    """Follow a family that a collision moved to a different stem."""
+    """Follow a family that a collision moved to a different stem.
+
+    Every URL carrying the old stem is rewritten, which is right exactly
+    because a stem names one item: see _stem_taken. It was not always so, and
+    a shared stem meant archiving one item silently repointed the other's URL
+    at it.
+    """
     idx = _load_url_index()
     changed = False
     for url, stems in idx.items():
@@ -3045,7 +3150,7 @@ def _forget_stem(stem: str) -> None:
 
 
 @app.post("/delete")
-async def delete_item(stem: str = Form(...), view: str = Form("archive")):
+async def delete_item(stem: str = Form(...), view: str = Form(...)):
     """Permanently delete one saved item, in one folder.
 
     One folder, because the inbox and the archive allocate names
@@ -3056,6 +3161,12 @@ async def delete_item(stem: str = Form(...), view: str = Form("archive")):
     """
     if not _safe_stem(stem):
         raise HTTPException(400, detail="invalid stem")
+    # Named, not defaulted, and required rather than optional: "anything that
+    # is not 'archive' means the inbox" turned a typo into a different,
+    # permanent operation, and an omitted field took the default silently.
+    # Both forms in the UI post the field, so nothing here is guessing.
+    if view not in ("inbox", "archive"):
+        raise HTTPException(422, detail="view must be 'inbox' or 'archive'")
     folder = _archive_dir() if view == "archive" else OUTPUT_DIR
     if not _storage_folder_safe(folder):
         raise HTTPException(409, detail="storage path is not a safe directory")
@@ -3074,10 +3185,12 @@ async def delete_item(stem: str = Form(...), view: str = Form("archive")):
 
 
 @app.post("/archive")
-async def archive(stem: str = Form(...), action: str = Form("archive")):
+async def archive(stem: str = Form(...), action: str = Form(...)):
     """Move all files of one saved item between the inbox and archive/."""
     if not _safe_stem(stem):
         raise HTTPException(400, detail="invalid stem")
+    if action not in ("archive", "restore"):
+        raise HTTPException(422, detail="action must be 'archive' or 'restore'")
     if action == "restore":
         src, dst, back = _archive_dir(), OUTPUT_DIR, "/?view=archive"
     else:
@@ -3092,7 +3205,13 @@ async def archive(stem: str = Form(...), action: str = Form("archive")):
                      and f.suffix.lower() in _SERVE_EXTS)]
         if files:
             formats = tuple(f.suffix.lstrip(".").lower() for f in files)
-            target = _family_path(dst / f"{stem}.md", formats)
+            # The family being moved does not count as the occupant of its
+            # own name: stems are unique across both folders, so a move keeps
+            # its name unless something arrived in the destination out of
+            # band — the output directory is synced and written to by other
+            # software.
+            target = _family_path(dst / f"{stem}.md", formats,
+                                  besides=frozenset(files))
             # One item is several files, and a rename can fail part way — a
             # full disk, a permission, the sync client holding one open. A
             # bare loop leaves the item split across both folders, listed in

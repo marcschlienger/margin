@@ -679,7 +679,7 @@ def test_delete_removes_files_and_index_entry(tmp_path, monkeypatch):
     app._record_url("https://a.test/z", "2026-07-19-z")
 
     client = TestClient(app.app)
-    r = client.post("/delete", data={"stem": "2026-07-19-z"},
+    r = client.post("/delete", data={"stem": "2026-07-19-z", "view": "archive"},
                     follow_redirects=False)
     assert r.status_code == 303
     assert not (tmp_path / "archive" / "2026-07-19-z.md").exists()
@@ -687,8 +687,10 @@ def test_delete_removes_files_and_index_entry(tmp_path, monkeypatch):
     assert app._find_existing("https://a.test/z") is None
     assert app._load_url_index() == {}          # index entry cleaned up
 
-    assert client.post("/delete", data={"stem": "../evil"}).status_code == 400
-    assert client.post("/delete", data={"stem": "2026-07-19-z"}).status_code == 404
+    assert client.post("/delete", data={"stem": "../evil",
+                                        "view": "archive"}).status_code == 400
+    assert client.post("/delete", data={"stem": "2026-07-19-z",
+                                        "view": "archive"}).status_code == 404
 
 
 def test_deleting_one_item_leaves_its_namesake_alone(tmp_path, monkeypatch):
@@ -969,7 +971,8 @@ def test_an_archive_symlink_cannot_read_or_delete_outside_the_root(tmp_path, mon
     assert "Outside" not in client.get("/?view=archive").text
     # 409, not 404: "your archive path is a symlink" is the useful answer,
     # and it is given before anything is looked at, let alone unlinked.
-    assert client.post("/delete", data={"stem": victim.stem}).status_code == 409
+    assert client.post("/delete", data={"stem": victim.stem,
+                                        "view": "archive"}).status_code == 409
     assert victim.is_file()
 
 
@@ -1452,9 +1455,10 @@ def test_a_compressed_pdf_cannot_outgrow_its_cap(monkeypatch):
 
     gc.collect()
     tracemalloc.start()
-    with pytest.raises(RuntimeError, match="exceeds"):
+    before = tracemalloc.get_traced_memory()[0]
+    with pytest.raises(app._DownloadTooLarge, match="larger than"):
         asyncio.run(run())
-    peak = tracemalloc.get_traced_memory()[1]
+    peak = tracemalloc.get_traced_memory()[1] - before
     tracemalloc.stop()
 
     # The assertion that matters is the *size* of the refusal, not the
@@ -2235,18 +2239,23 @@ def _served_page(body, extra_headers=b""):
     async def run(cap_test):
         async def serve(reader, writer):
             await reader.readuntil(b"\r\n\r\n")
-            # Headers and body in two writes: joining them would copy the
-            # body inside the measured region and the harness would be what
-            # the peak is measuring.
+            # Headers first, then the body in bounded pieces, draining after
+            # each. A single large write is buffered by the transport — on
+            # Python 3.10, the suite's own floor, it copies the whole 40 MiB
+            # inside the measured region, and the harness becomes what the
+            # peak is measuring. Measured there: 80.5 MiB against an 8 MiB
+            # assertion, while the app was refusing the page correctly.
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                          + extra_headers +
                          b"Content-Length: %d\r\nConnection: close\r\n\r\n"
                          % len(body))
-            writer.write(body)
+            chunk = 64 * 1024
             try:
-                await writer.drain()
+                for start in range(0, len(body), chunk):
+                    writer.write(body[start:start + chunk])
+                    await writer.drain()      # and stop when the client goes
             except Exception:                                  # noqa: BLE001
-                pass
+                pass                          # the reader hung up, as intended
 
         server = await asyncio.start_server(serve, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
@@ -2280,8 +2289,12 @@ def test_a_page_cannot_be_as_large_as_the_server_likes(monkeypatch, tmp_path):
 
     gc.collect()
     tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
     result = asyncio.run(_served_page(body)(cap))
-    peak = tracemalloc.get_traced_memory()[1]
+    # A delta, not the absolute peak: get_traced_memory reports every traced
+    # block alive in the process, so anything an earlier test left behind
+    # counted towards this one and turned an unrelated failure into two.
+    peak = tracemalloc.get_traced_memory()[1] - before
     tracemalloc.stop()
 
     assert result["status"] == "error"
@@ -2415,3 +2428,258 @@ def test_an_archive_that_works_still_moves_the_whole_family(tmp_path, monkeypatc
                        follow_redirects=False).status_code == 303
     assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == \
         [f"{stem}.md", f"{stem}.pdf", f"{stem}.tex"]
+
+
+# ---------------------------------------------------------------------------
+# A second review round: a stem is an identity, and identities must be unique
+# ---------------------------------------------------------------------------
+
+def test_a_stem_names_one_item_across_both_folders(tmp_path, monkeypatch):
+    """Everything else in the app addresses an item by stem alone — the URL
+    index, the archive and delete forms, the service worker's forget message —
+    and none of them carry a folder. Allocating per folder let the inbox and
+    the archive hold two different items under one name."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "2026-09-04-same.pdf").write_bytes(b"%PDF archived")
+
+    # A new capture with the same slug on the same day may not take the name.
+    fresh = app._family_path(tmp_path / "2026-09-04-same.pdf", ("pdf",))
+    assert fresh.name == "2026-09-04-same-2.pdf"
+    # …and it is the *archive* that is holding it, not the inbox.
+    assert not (tmp_path / "2026-09-04-same.pdf").exists()
+
+    # An item is not its own occupant: archiving keeps the name it has.
+    (tmp_path / "2026-09-04-other.md").write_text("x", encoding="utf-8")
+    moving = [tmp_path / "2026-09-04-other.md"]
+    landed = app._family_path(tmp_path / "archive" / "2026-09-04-other.md",
+                              ("md",), besides=frozenset(moving))
+    assert landed.name == "2026-09-04-other.md"
+
+
+def test_archiving_one_item_leaves_the_other_ones_url_alone(tmp_path, monkeypatch):
+    """The consequence, end to end, with a collision an older version left
+    behind: restoring the archived copy renamed it and then rewrote *both*
+    URLs to the new stem, so the inbox item's URL resolved to a document it
+    had nothing to do with."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "same.pdf").write_bytes(b"%PDF inbox")
+    (tmp_path / "archive" / "same.pdf").write_bytes(b"%PDF archived")
+    app._record_url("https://a.test/inbox", "same")
+    app._record_url("https://b.test/archived", "same")
+
+    # The migration is what repairs this; the app only has to stop making it.
+    import subprocess
+    import sys as _sys
+    script = Path(app.__file__).parent / "deploy" / "unique-stems.py"
+    done = subprocess.run([_sys.executable, str(script), "--output-dir",
+                           str(tmp_path), "--apply"],
+                          capture_output=True, text=True, check=True)
+    assert "cannot tell which URL" in done.stdout      # PDF-only, no front matter
+
+    index = app._load_url_index()
+    assert index["https://a.test/inbox"] == ["same"]   # the inbox item is untouched
+    assert (tmp_path / "same.pdf").read_bytes() == b"%PDF inbox"
+    assert (tmp_path / "archive" / "same-2.pdf").read_bytes() == b"%PDF archived"
+
+
+def test_the_migration_follows_a_url_it_can_identify(tmp_path, monkeypatch):
+    """With front matter to read, the archived family's URL moves with it and
+    the inbox item keeps its own."""
+    import subprocess
+    import sys as _sys
+
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "same.pdf").write_bytes(b"%PDF inbox")
+    (tmp_path / "archive" / "same.md").write_text(
+        '---\ntitle: "Archived"\nsource_url: "https://b.test/archived"\n---\n\nx\n',
+        encoding="utf-8")
+    app._record_url("https://a.test/inbox", "same")
+    app._record_url("https://b.test/archived", "same")
+
+    script = Path(app.__file__).parent / "deploy" / "unique-stems.py"
+    subprocess.run([_sys.executable, str(script), "--output-dir", str(tmp_path),
+                    "--apply"], capture_output=True, text=True, check=True)
+    index = app._load_url_index()
+    assert index["https://a.test/inbox"] == ["same"]
+    assert index["https://b.test/archived"] == ["same-2"]
+    assert (tmp_path / "archive" / "same-2.md").is_file()
+
+
+def test_a_startup_says_so_when_two_items_share_a_name(tmp_path, monkeypatch, capsys):
+    """Allocation cannot undo what an older version wrote, so the operator is
+    told where to look rather than left with a URL that resolves wrongly."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    app._warn_about_shared_stems()
+    assert capsys.readouterr().err == ""      # _log writes to stderr
+
+    (tmp_path / "same.pdf").write_bytes(b"%PDF")
+    (tmp_path / "archive" / "same.pdf").write_bytes(b"%PDF")
+    app._warn_about_shared_stems()
+    said = capsys.readouterr().err
+    assert "same" in said and "unique-stems.py" in said
+
+    # …and it is wired into startup, not merely available to be called.
+    with TestClient(app.app):
+        pass
+    assert "unique-stems.py" in capsys.readouterr().err
+
+
+def _save_against(page_or_pdf, formats, tmp_path, renderer=None,
+                  content_type="text/html", second=None):
+    """Run /save's handler against a loopback server, with a stub renderer."""
+    import types
+
+    served = {"body": page_or_pdf, "type": content_type}
+
+    async def run():
+        async def serve(reader, writer):
+            request = await reader.readuntil(b"\r\n\r\n")
+            body = served["body"]
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                         % (served["type"].encode(), len(body)))
+            if request.split(b" ", 1)[0] != b"HEAD":   # HEAD gets the headers
+                writer.write(body)
+            try:
+                await writer.drain()
+            except Exception:                                  # noqa: BLE001
+                pass
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        url = f"http://127.0.0.1:{port}/thing"
+        async with httpx.AsyncClient(timeout=20) as client:
+            state = types.SimpleNamespace(client=client, renderer=renderer)
+            request = types.SimpleNamespace(
+                app=types.SimpleNamespace(state=state))
+            try:
+                first = await app._save_reserved(
+                    app.SavePayload(url=url, formats=list(formats)), request)
+                if second is None:
+                    return first, None
+                return first, await app._save_reserved(
+                    app.SavePayload(url=url, formats=list(second)), request)
+            finally:
+                server.close()
+
+    return asyncio.run(run())
+
+
+class _StubRenderer:
+    """A renderer that records what it was asked to print."""
+
+    available = True
+
+    def __init__(self, html="<html><body><p>x</p></body></html>",
+                 title="Rendered"):
+        self.asked = []
+        self._html, self._title = html, title
+
+    async def render(self, url):
+        from render import RenderResult
+        self.asked.append(url)
+        return RenderResult(html=self._html, title=self._title,
+                            pdf=b"%PDF printed-by-chromium", status=200)
+
+
+def test_a_pdf_the_limit_refused_is_not_printed_instead(tmp_path, monkeypatch):
+    """The download cap raised, the probe's `except Exception` turned that
+    into "not a PDF", and the web-page branch handed the same URL to
+    Chromium — which loaded and printed the file the limit had just refused,
+    and answered "ok"."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", True)
+    monkeypatch.setattr(app, "MAX_DOWNLOAD_BYTES", 1024)
+    renderer = _StubRenderer()
+
+    result, _ = _save_against(b"%PDF-1.4\n" + b"0" * 200_000, ("pdf",),
+                              tmp_path, renderer,
+                              content_type="application/pdf")
+    assert result["status"] == "error"
+    assert "larger than the 1 kB download limit" in result["message"]
+    assert renderer.asked == [], "the renderer was handed the refused PDF"
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".pdf"] == []
+
+
+def test_the_download_limit_says_a_size_that_exists():
+    """Integer megabytes read "0 MB" for any cap below one, which is exactly
+    what a test with a small cap is shown."""
+    for cap, expected in ((100 * 2**20, "100 MB"), (4096, "4 kB"), (12, "12 bytes")):
+        app.MAX_DOWNLOAD_BYTES = cap
+        assert expected in app._too_large("https://x.test/a")
+    app.MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+
+
+def test_completing_a_half_saved_capture_keeps_one_item(tmp_path, monkeypatch):
+    """A capture whose Markdown half failed leaves a PDF. Asking again for
+    both formats regenerated the PDF too, collision allocation moved the
+    whole family to "-2", and one URL became two queue entries with the PDF
+    written twice."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app, "ALLOW_PRIVATE_URLS", True)
+    page = ("<html><head><title>Half Saved</title></head><body><article><p>"
+            + PAD + "</p></article></body></html>").encode()
+    renderer = _StubRenderer(html=page.decode(), title="Half Saved")
+
+    first, second = _save_against(page, ("pdf",), tmp_path, renderer,
+                                  second=("pdf", "md"))
+    assert first["files"] == ["2026-09-06-half-saved.pdf"] or \
+        first["files"][0].endswith("half-saved.pdf")
+    stem = Path(first["files"][0]).stem
+    assert second["status"] == "ok"
+    assert second["files"] == [f"{stem}.md"], second["files"]
+    assert renderer.asked == [renderer.asked[0]]      # rendered once, not twice
+
+    names = sorted(p.name for p in tmp_path.iterdir() if p.is_file()
+                   and p.suffix in (".pdf", ".md"))
+    assert names == [f"{stem}.md", f"{stem}.pdf"]
+    assert [i["stem"] for i in app._list_items(tmp_path)] == [stem]
+    assert list(app._load_url_index().values()) == [[stem]]
+
+
+def test_an_archived_item_is_not_completed_into_the_inbox(tmp_path, monkeypatch):
+    """Adding the missing format would write half the family into the inbox
+    and leave the rest in the archive."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "archive" / "2026-09-04-put-away.pdf").write_bytes(b"%PDF")
+    app._record_url("https://a.test/x", "2026-09-04-put-away")
+
+    existing = app._find_existing("https://a.test/x")
+    assert existing["archived"] is True
+    assert existing["stem"] == "2026-09-04-put-away"
+
+
+def test_a_destructive_selector_has_to_be_named(tmp_path, monkeypatch):
+    """"Anything that is not 'archive' means the inbox" turned a typo into a
+    different, permanent operation — and let a caller skip the
+    archive-before-delete workflow the confirm-prompted UI is built on."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    (tmp_path / "archive").mkdir()
+    (tmp_path / "2026-09-04-keep.pdf").write_bytes(b"%PDF inbox")
+    (tmp_path / "archive" / "2026-09-04-gone.pdf").write_bytes(b"%PDF archived")
+    client = TestClient(app.app)
+
+    for bad in ("Archive", "inbox ", "", "trash"):
+        answer = client.post("/delete", data={"stem": "2026-09-04-keep",
+                                              "view": bad})
+        assert answer.status_code == 422, (bad, answer.status_code)
+    assert (tmp_path / "2026-09-04-keep.pdf").is_file()
+
+    for bad in ("Restore", "move", ""):
+        answer = client.post("/archive", data={"stem": "2026-09-04-keep",
+                                               "action": bad})
+        assert answer.status_code == 422, (bad, answer.status_code)
+    assert (tmp_path / "2026-09-04-keep.pdf").is_file()
+
+    # The two spellings the UI posts still work.
+    assert client.post("/delete", data={"stem": "2026-09-04-gone",
+                                        "view": "archive"},
+                       follow_redirects=False).status_code == 303
+    assert client.post("/archive", data={"stem": "2026-09-04-keep",
+                                         "action": "archive"},
+                       follow_redirects=False).status_code == 303

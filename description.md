@@ -643,6 +643,30 @@ genuinely new save with the same stem can still be cached.
   or the tailnet. Origins in `MARGIN_CORS_ORIGINS` are exempt by design:
   refusing their POST after answering the preflight made the documented
   extension case impossible.
+- **A stem is an identity, so it has to be unique.** The part before the
+  extension is what the URL index keys on, what the archive and delete forms
+  post, and what the service worker is told to forget — none of which carry a
+  folder alongside it. Allocation used to ask only the folder being written
+  to, so the inbox and `archive/` could each hold a different item called
+  "2026-07-19-a-title"; archiving one then renamed it and rewrote *every* URL
+  carrying that stem, and the other item's URL resolved to a document it had
+  nothing to do with. Allocation now spans both folders, an item is not
+  treated as the occupant of its own name while it moves, and
+  `deploy/unique-stems.py` repairs what an older version wrote. The rename
+  that follows a collision is still index-wide, and that is correct precisely
+  because the stem names one item.
+- **A refusal is not a fallback.** The direct-PDF probe distinguishes "this
+  is not a PDF" from "this PDF is too large": the first falls through to the
+  web-page branch, the second is the answer. Sharing one exception meant the
+  download limit rejected a file and Chromium then printed it, which is the
+  same bytes through a slower path and a reported success.
+- **A partial capture is completed, not repeated.** When an earlier save of a
+  URL produced only some of the formats now asked for, only the missing ones
+  are written, onto the stem that already exists. Repeating the whole set
+  made the existing files collide with themselves, so the family moved to
+  "-2" and one URL became two queue entries with the PDF stored twice. An
+  archived family is left alone instead: completing it would put half of the
+  item back in the inbox.
 - **Nothing is read unbounded.** An upload stops at 50 MB, a downloaded PDF
   at 100 MB, and a page's HTML at 8 MB — and every one of those bounds sits
   on the wire, expanding a content coding under the same limit rather than

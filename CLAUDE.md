@@ -25,7 +25,8 @@ the math typesetting and the web fonts have finished.
   `icon.svg` + generated PNGs.
 - `deploy/` — `gen_icons.py` (re-render PNGs from icon.svg), systemd unit,
   `install.sh` + `add-instance.sh` (Ubuntu, one instance per person),
-  `paths.sh` (shared path guards), `make-constraints.sh` (version pins).
+  `paths.sh` (shared path guards), `make-constraints.sh` (version pins),
+  `unique-stems.py` (one-off repair for stems shared by two items).
 - `tests/` — `test_margin.py`: pytest, no network or browser.
   `test_browser.py`: Playwright against a real server on a loopback port, for
   what only exists in a browser; skips without chromium.
@@ -64,3 +65,10 @@ shellcheck -x deploy/*.sh             # -x, or it stops at the sourced paths.sh
 - The service worker never stores a URL carrying `?token=`, and deleting an
   item tells it so before the form navigates — offline, nothing else ever
   will.
+- A stem (the filename without its extension) names exactly one item across
+  the inbox and `archive/` together. The URL index, the archive and delete
+  forms and the service worker all address an item by stem alone, with no
+  folder attached, so allocation has to ask both folders.
+- Anything that deletes or moves takes its direction as a required, named
+  value. No destructive default, and no "everything else means the other
+  one".

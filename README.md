@@ -85,6 +85,11 @@ produces the same files however it's triggered. `formats` may also be a
 comma-separated string (`"pdf,md"`), which iOS Shortcuts can send more easily
 than a JSON array.
 
+A URL whose PDF is larger than the 100 MB download limit is refused, and
+that is the end of it: the refusal used to be read as "this is not a PDF",
+after which the page was handed to Chromium, which loaded and printed the
+file the limit had just turned down.
+
 - **`pdf`** — renders the page in headless Chromium and exports A4 PDF with
   screen CSS and backgrounds. The renderer waits, in order: DOM content
   loaded (≤ 60 s) → network idle (best effort, ≤ 15 s) → MathJax 2/3
@@ -192,8 +197,14 @@ home-screen web app, which has no browser chrome to navigate back with.
 
 Supporting endpoints: `GET /files/{name}` serves raw saved files (inbox or
 archive; only `.pdf/.md/.tex/.org`, no path traversal; `?download=1` forces
-an attachment), and `POST /archive` (form fields `stem`,
-`action=archive|restore`) moves items.
+an attachment), `POST /archive` (form fields `stem` and `action`) moves
+items, and `POST /delete` (form fields `stem` and `view`) removes one.
+
+Both of those fields are **required, and are checked against the two values
+they accept** — `archive`/`restore` and `inbox`/`archive`. Neither has a
+default: "anything that is not `archive` means the inbox" turned a typo into
+a different, permanent operation, and an omitted field took the safe-looking
+default silently. Anything else answers 422 and changes nothing.
 
 ### `GET /save-page` — bookmarklet target
 
@@ -228,6 +239,17 @@ Debug helper: echoes method, headers, and parsed body of the request back.
 - Filenames: `YYYY-MM-DD-title-slug.{pdf,md,tex,org}`. Titles come from the
   page `<title>`/`og:title` (site-name suffixes like `… | Site` stripped);
   name collisions get `-2`, `-3`, … suffixes — nothing is ever overwritten.
+- **A stem names one item.** The part before the extension is how everything
+  addresses a saved item — the URL index, the archive and delete forms, the
+  offline cache — and none of those carry a folder with it, so a stem free in
+  the inbox but taken in `archive/` is not free. If an older version left you
+  two items sharing one, `deploy/unique-stems.py` renames the archived side
+  and follows it in the index; the server says so at startup when it finds
+  any.
+- **A save that produced only some formats is completed in place.** Ask again
+  for `["pdf", "md"]` after the Markdown half failed and only the `.md` is
+  written, beside the PDF that is already there — not a second copy of the
+  whole family under `-2`.
 - Markdown files start with YAML frontmatter:
 
   ```markdown
@@ -759,7 +781,7 @@ Tailscale, WireGuard) and/or use the per-instance `MARGIN_TOKEN` — see
 | `app.py` | FastAPI server: endpoints, math extraction, Markdown pipeline |
 | `render.py` | Playwright wrapper: rendered HTML + PDF export, wait logic |
 | `tests/` | Unit tests (`pip install -r requirements-dev.txt && python -m pytest`) |
-| `deploy/` | Ubuntu installer, per-person instance script, systemd template, icon regeneration |
+| `deploy/` | Ubuntu installer, per-person instance script, systemd template, icon regeneration, `unique-stems.py` |
 | `static/` | App icon (SVG master + generated PNGs) and web manifest |
 | `description.md` | Architecture and the seven math-extraction strategies |
 | `shortcut_setup.md` | Step-by-step iOS Shortcut construction |
