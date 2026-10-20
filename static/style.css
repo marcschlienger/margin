@@ -76,10 +76,15 @@ form.saver {
   padding: .9rem;
   box-shadow: 0 1px 3px rgba(60, 50, 20, .07);
 }
-form.saver .row { display: flex; gap: .6rem; align-items: center; }
+form.saver .row {
+  display: flex;
+  gap: .6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
 form.saver input[type=url] {
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 13rem;
+  min-width: 10rem;
   border: none;
   background: transparent;
   font: 1.05rem/1.5 var(--serif);
@@ -100,6 +105,11 @@ button {
 }
 button:active { transform: translateY(1px); }
 button[disabled] { opacity: .55; cursor: default; }
+button.secondary {
+  border: 1px solid var(--pen-blue);
+  background: transparent;
+  color: var(--pen-blue);
+}
 
 /* Anything that acts on what is already on screen is a link, not a slab:
    one filled button per view, and it is the one that starts something. */

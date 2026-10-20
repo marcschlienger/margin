@@ -97,9 +97,9 @@ MARGIN_TOKEN = os.getenv("MARGIN_TOKEN", "").strip()
 # Output formats. MD_FORMATS are the text formats the Markdown pipeline emits
 # (tex/org derived from md via Pandoc). DEFAULT_FORMATS is what a save writes
 # when the request doesn't specify — set via the DEFAULT_FORMATS env var
-# (comma-separated subset of pdf/md/tex/org). Every capture path (/save,
-# /save-page bookmarklet, /save-url iOS shortcut, the queue's pre-checked
-# boxes) honors it, so a save produces the same files however it was made.
+# (comma-separated subset of pdf/md/tex/org). API requests that omit formats
+# and the bookmarklet honor it. The queue deliberately starts with its lighter
+# text-only choice below; its explicit checkboxes still offer every format.
 MD_FORMATS = ("md", "tex", "org")
 _ALL_FORMATS = ("pdf",) + MD_FORMATS
 
@@ -119,6 +119,13 @@ def _parse_default_formats(raw: str) -> tuple[str, ...]:
 DEFAULT_FORMATS = _parse_default_formats(
     os.getenv("DEFAULT_FORMATS", "pdf,md,tex")
 )
+# The queue is the frequent copy/paste path, where a headless PDF is the slow
+# and least reliable part. These are only the form's initial checked values;
+# the remembered browser choice wins after the first change, and clearing all
+# boxes still means DEFAULT_FORMATS just as it does without JavaScript.
+QUICK_SAVE_FORMATS = ("md", "tex")
+
+
 def _text_formats(formats: tuple[str, ...]) -> tuple[str, ...]:
     """The text-only slice of a format list, for the steps that write text
     and cannot write a PDF: /save-url's whole job, and /save-pdf's OCR.
@@ -2529,21 +2536,26 @@ __HEAD__
     </div>
   </header>
 
-  <form class="saver" method="get" action="/save-page">
+  <form class="saver" id="save-form" method="get" action="/save-page">
     <div class="row">
-      <input type="url" name="url" placeholder="https://…  save a page" required>
-      <button type="submit">Save</button>
+      <input id="save-url" type="url" name="url"
+             placeholder="https://…  save a page" required>
+      <button id="paste-save" type="button" hidden>Paste &amp; save</button>
+      <button id="save-button" class="secondary" type="submit">Save</button>
     </div>
+    <p id="flash" role="status" aria-live="polite" hidden></p>
     <details class="formats">
       <summary>Formats: <b id="fmt-summary"></b></summary>
       <div class="fmt-list">__FORMAT_CHECKBOXES__</div>
     </details>
   </form>
 
-  <div class="queue-head">__TABS__</div>
-  <!--offline-notice-->
-  <input id="filter" type="search" placeholder="Filter by title…">
-  __ROWS__
+  <section id="queue">
+    <div class="queue-head">__TABS__</div>
+    <!--offline-notice-->
+    <input id="filter" type="search" placeholder="Filter by title…">
+    __ROWS__
+  </section>
 </main>
 <script>
 if ('serviceWorker' in navigator) {
@@ -2551,43 +2563,48 @@ if ('serviceWorker' in navigator) {
     .catch((e) => console.warn('SW registration failed', e));
 }
 
-// Tell the worker before the form navigates away: the 404-driven cleanup
-// only fires if someone asks for the file again, and offline that may never
-// happen — so a deleted page would stay readable for ever.
-document.querySelectorAll('form[action="/delete"]').forEach(function (form) {
-  form.addEventListener('submit', function (event) {
-    // One listener owns both halves. With confirm() in an onsubmit attribute
-    // and the message in a listener of its own, cancelling stopped the
-    // navigation and sent forget-stem anyway: the server kept the item and
-    // its offline copy vanished.
-    if (!window.confirm(form.dataset.confirm)) {
-      event.preventDefault();
-      return;
-    }
-    const stem = form.querySelector('input[name=stem]').value;
-    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage(
-        {type: 'forget-stem', stem: stem});
-    }
+function bindQueue(root) {
+  // Tell the worker before the form navigates away: the 404-driven cleanup
+  // only fires if someone asks for the file again, and offline that may never
+  // happen — so a deleted page would stay readable for ever.
+  root.querySelectorAll('form[action="/delete"]').forEach(function (form) {
+    form.addEventListener('submit', function (event) {
+      // One listener owns both halves. With confirm() in an onsubmit attribute
+      // and the message in a listener of its own, cancelling stopped the
+      // navigation and sent forget-stem anyway: the server kept the item and
+      // its offline copy vanished.
+      if (!window.confirm(form.dataset.confirm)) {
+        event.preventDefault();
+        return;
+      }
+      const stem = form.querySelector('input[name=stem]').value;
+      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage(
+          {type: 'forget-stem', stem: stem});
+      }
+    });
   });
-});
 
-document.getElementById('filter').addEventListener('input', function () {
-  const q = this.value.toLowerCase();
-  document.querySelectorAll('.item').forEach(function (el) {
-    el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
+  const filter = root.querySelector('#filter');
+  filter.addEventListener('input', function () {
+    const q = this.value.toLowerCase();
+    root.querySelectorAll('.item').forEach(function (el) {
+      el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
   });
-});
 
-// The date is written as an ISO stamp so it is still right without script;
-// this reads it back in whatever order the reader's locale puts it.
-document.querySelectorAll('time[datetime]').forEach(function (el) {
-  const when = new Date(el.getAttribute('datetime') + 'T12:00:00');
-  if (isNaN(when.getTime())) return;
-  const parts = { month: 'short', day: 'numeric' };
-  if (when.getFullYear() !== new Date().getFullYear()) parts.year = 'numeric';
-  el.textContent = when.toLocaleDateString([], parts);
-});
+  // The date is written as an ISO stamp so it is still right without script;
+  // this reads it back in whatever order the reader's locale puts it.
+  root.querySelectorAll('time[datetime]').forEach(function (el) {
+    const when = new Date(el.getAttribute('datetime') + 'T12:00:00');
+    if (isNaN(when.getTime())) return;
+    const parts = { month: 'short', day: 'numeric' };
+    if (when.getFullYear() !== new Date().getFullYear()) parts.year = 'numeric';
+    el.textContent = when.toLocaleDateString([], parts);
+  });
+}
+
+bindQueue(document.getElementById('queue'));
 
 // Format checkboxes: restore last choice, keep the summary line current.
 (function () {
@@ -2595,7 +2612,8 @@ document.querySelectorAll('time[datetime]').forEach(function (el) {
   const boxes = Array.from(
     document.querySelectorAll('.fmt-list input[type=checkbox]'));
   let saved = null;
-  try { saved = localStorage.getItem('margin-formats'); } catch (e) { /* private mode */ }
+  try { saved = localStorage.getItem('margin-quick-formats-v2'); }
+  catch (e) { /* private mode */ }
   if (saved !== null) {
     const picked = saved.split(',');
     boxes.forEach(b => { b.checked = picked.includes(b.value); });
@@ -2603,18 +2621,109 @@ document.querySelectorAll('time[datetime]').forEach(function (el) {
   // An empty form field is simply absent from a GET, and /save-page falls
   // back to DEFAULT_FORMATS rather than saving nothing. Saying "none" was a
   // lie about a save that was about to happen anyway.
-  const fallback = boxes.filter(b => b.dataset.default !== undefined)
+  const fallback = boxes.filter(b => b.dataset.serverDefault !== undefined)
                         .map(b => NAMES[b.value]).join(', ');
   function update() {
     const picked = boxes.filter(b => b.checked).map(b => b.value);
     document.getElementById('fmt-summary').textContent =
       picked.length ? picked.map(v => NAMES[v]).join(', ')
                     : 'server default — ' + fallback;
-    try { localStorage.setItem('margin-formats', picked.join(',')); }
+    try { localStorage.setItem('margin-quick-formats-v2', picked.join(',')); }
     catch (e) { /* nothing to remember it with */ }
   }
   boxes.forEach(b => b.addEventListener('change', update));
   update();
+})();
+
+// Keep the ordinary GET form as the no-JavaScript fallback. In a current
+// browser, save in place so the result remains visible and the queue can be
+// refreshed without leaving a home-screen app on a transient result page.
+(function () {
+  const form = document.getElementById('save-form');
+  const input = document.getElementById('save-url');
+  const save = document.getElementById('save-button');
+  const paste = document.getElementById('paste-save');
+  const flash = document.getElementById('flash');
+
+  function report(message, error) {
+    flash.textContent = message;
+    flash.classList.toggle('error', !!error);
+    flash.hidden = false;
+  }
+
+  function busy(value) {
+    save.disabled = value;
+    paste.disabled = value;
+    save.textContent = value ? 'Saving…' : 'Save';
+  }
+
+  async function refreshQueue() {
+    const answer = await fetch(window.location.href, {
+      headers: {'Accept': 'text/html'}, cache: 'no-store'
+    });
+    if (!answer.ok) throw new Error('could not refresh the queue');
+    const page = new DOMParser().parseFromString(await answer.text(), 'text/html');
+    const fresh = page.getElementById('queue');
+    if (!fresh) throw new Error('the refreshed queue was incomplete');
+    document.getElementById('queue').replaceWith(fresh);
+    bindQueue(fresh);
+  }
+
+  form.addEventListener('submit', async function (event) {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+
+    const data = new FormData(form);
+    const payload = {url: input.value.trim()};
+    const formats = data.getAll('formats');
+    if (formats.length) payload.formats = formats;
+
+    busy(true);
+    report('Saving…', false);
+    try {
+      const answer = await fetch('/save', {
+        method: 'POST',
+        headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      let result;
+      try { result = await answer.json(); }
+      catch (e) { throw new Error('the server returned an unreadable response'); }
+      if (!answer.ok || result.status !== 'ok') {
+        throw new Error(result.message || result.detail || 'the save failed');
+      }
+      let message = result.summary || 'Saved';
+      if (result.warnings && result.warnings.length) {
+        message += ' — Warning: ' + result.warnings.join('; ');
+      }
+      report(message, false);
+      input.value = '';
+      try {
+        await refreshQueue();
+      } catch (refreshError) {
+        report(message + ' — The queue could not refresh; reload to see it.',
+               false);
+      }
+    } catch (error) {
+      report('Could not save: ' + (error.message || error), true);
+    } finally {
+      busy(false);
+    }
+  });
+
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    paste.hidden = false;
+    paste.addEventListener('click', async function () {
+      try {
+        input.value = (await navigator.clipboard.readText()).trim();
+        if (!input.value) throw new Error('the clipboard is empty');
+        form.requestSubmit();
+      } catch (error) {
+        report('Could not read the clipboard: ' + (error.message || error) +
+               '. Paste the link into the field instead.', true);
+      }
+    });
+  }
 })();
 </script>
 </body></html>"""
@@ -2632,7 +2741,7 @@ def _storage_folder_safe(folder: Path) -> bool:
             and _inside(folder, OUTPUT_DIR))
 
 
-# Quick-save format checkboxes; pre-checked to match DEFAULT_FORMATS.
+# Quick-save format checkboxes; text formats are the lighter initial choice.
 _FORMAT_LABELS = [
     ("pdf", "PDF", "the page exactly as rendered"),
     ("md", "Markdown", "article text, math as LaTeX (.md)"),
@@ -2642,17 +2751,19 @@ _FORMAT_LABELS = [
 
 
 def _format_checkboxes() -> str:
-    """Boxes for the quick-save form, pre-checked to match DEFAULT_FORMATS.
+    """Boxes for the quick-save form, initially checked for quick text saves.
 
-    data-default marks the same set for the script: clearing every box does
-    not save nothing, it saves the server default, and the summary line has
-    to be able to say which formats those are.
+    data-server-default names the server fallback for the script: clearing
+    every box does not save nothing, it saves DEFAULT_FORMATS, and the summary
+    line has to be able to say which formats those are.
     """
     rows = []
     for val, name, desc in _FORMAT_LABELS:
-        default = ' data-default checked' if val in DEFAULT_FORMATS else ''
+        server_default = ' data-server-default' if val in DEFAULT_FORMATS else ''
+        checked = ' checked' if val in QUICK_SAVE_FORMATS else ''
         rows.append(
-            f'<label><input type="checkbox" name="formats" value="{val}"{default}> '
+            f'<label><input type="checkbox" name="formats" value="{val}"'
+            f'{server_default}{checked}> '
             f'{name} <small>— {desc}</small></label>'
         )
     return "\n      ".join(rows)

@@ -159,13 +159,14 @@ def test_default_formats_shared_everywhere():
         ["pdf", "md"]
 
 
-def test_queue_checkboxes_reflect_default(tmp_path, monkeypatch):
+def test_queue_checkboxes_distinguish_quick_choice_from_server_default(
+        tmp_path, monkeypatch):
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
     html = TestClient(app.app).get("/").text
-    assert 'value="pdf" data-default checked' in html
-    assert 'value="md" data-default checked' in html
-    assert 'value="tex" data-default checked' in html
-    assert 'value="org" data-default' not in html   # Org opt-in
+    assert 'value="pdf" data-server-default>' in html
+    assert 'value="md" data-server-default checked>' in html
+    assert 'value="tex" data-server-default checked>' in html
+    assert 'value="org">' in html                  # available, but opt-in
 
 
 def test_source_link_from_index_for_pdf_only(tmp_path, monkeypatch):
@@ -1952,7 +1953,8 @@ def test_cancelling_the_delete_prompt_keeps_the_offline_copy():
     assert "onsubmit=" not in source
     assert 'data-confirm="Delete permanently' in source
     listener = source[source.index("form[action=\"/delete\"]"):]
-    listener = listener[:listener.index("});\n});") + 8]
+    listener = listener[:listener.index(
+        "bindQueue(document.getElementById('queue'))")]
     assert "window.confirm(form.dataset.confirm)" in listener
     assert "event.preventDefault()" in listener
     assert "forget-stem" in listener
@@ -2224,7 +2226,11 @@ def test_clearing_every_format_box_says_what_will_be_saved():
     update = update[:update.index("\n  }")]
     assert "'none'" not in update
     assert "'server default — ' + fallback" in update
-    assert "data-default" in app._format_checkboxes()
+    boxes = app._format_checkboxes()
+    assert "data-server-default" in boxes
+    assert 'value="pdf" data-server-default>' in boxes
+    assert 'value="md" data-server-default checked>' in boxes
+    assert 'value="tex" data-server-default checked>' in boxes
 
 
 def _served_page(body, extra_headers=b""):

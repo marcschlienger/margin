@@ -79,11 +79,12 @@ parameter, or the browser cookie) and answers HTTP 401 without it — see
 
 `formats` is optional; any subset of `pdf`, `md`, `tex`, `org`, each selected
 independently. Omitted, it uses the server default (`DEFAULT_FORMATS`,
-shipping as `pdf,md,tex`) — the *same* default every capture path uses
-(bookmarklet, iOS shortcut, the queue's pre-checked boxes), so a save
-produces the same files however it's triggered. `formats` may also be a
-comma-separated string (`"pdf,md"`), which iOS Shortcuts can send more easily
-than a JSON array.
+shipping as `pdf,md,tex`). The bookmarklet and API clients that omit the field
+use that default. The queue's frequent copy/paste path starts with Markdown
+and LaTeX selected to avoid invoking the slower, less widely accepted
+headless-PDF renderer, but all four choices remain available and the browser
+remembers later choices. `formats` may also be a comma-separated string
+(`"pdf,md"`), which iOS Shortcuts can send more easily than a JSON array.
 
 A URL whose PDF is larger than the 100 MB download limit is refused, and
 that is the end of it: the refusal used to be read as "this is not a PDF",
@@ -171,9 +172,12 @@ said you did not want.
 
 A minimal web UI over the output directory: every saved item with its date,
 title (from the Markdown frontmatter when available), links to its files and
-original source, a quick-save box (with per-format checkboxes — PDF,
-Markdown, LaTeX, Org — that remember your last choice), a client-side title
-filter, and an
+original source, and a quick-save box with a **Paste & save** control and
+per-format checkboxes (PDF, Markdown, LaTeX, Org) that remember your last
+choice. A save stays on the queue, reports **Saving**, **Saved**, **Already
+saved**, warnings or the exact failure inline, and refreshes the list on
+success. Without JavaScript the ordinary Save button still navigates to the
+result page. The queue also has a client-side title filter and an
 **Archive** button that moves an item's files into an `archive/` subfolder
 (with a restore view at `/?view=archive`). The archive view also offers
 permanent **Delete** (confirmation prompt; removes all of an item's files

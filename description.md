@@ -98,8 +98,10 @@ warning in the response.
 **Input:** JSON body `{ "url": "https://...", "formats": [...] }` —
 `formats` optional, any subset of `pdf`, `md`, `tex`, `org`, each selected
 independently; may also be a comma-separated string. Omitted, it uses the
-`DEFAULT_FORMATS` env setting (ships as `pdf,md,tex`), which every capture
-path shares so a save yields the same files however it was triggered.
+`DEFAULT_FORMATS` env setting (ships as `pdf,md,tex`). API clients and the
+bookmarklet use it when they omit formats. The queue sends its explicit
+checkbox choice and initially selects `md,tex`; the browser remembers later
+choices.
 
 `DEFAULT_FORMATS` is also allowed to name no text format at all. The steps
 that can only write text then have nothing to do, and each says what that
@@ -200,7 +202,11 @@ top-level navigation is always allowed. The tab closes itself on success.
 
 Lists every saved item in the output directory: date, title (from Markdown
 frontmatter when present), links to each file and the original source, a
-quick-save form, and per-item Archive buttons. `/?view=archive` shows archived
+quick-save form, and per-item Archive buttons. The form can read a URL from
+the clipboard on a user gesture, saves through `POST /save`, keeps its
+Saving/Saved/Already saved/error result visible, and refreshes the queue in
+place. Its ordinary `GET /save-page` submission remains the no-JavaScript
+fallback. `/?view=archive` shows archived
 items with Restore buttons. File links open in the built-in reader
 (`GET /read/{name}`): back-to-queue navigation, native Share (Web Share API,
 whole file attached), Copy, Download; Markdown rendered server-side through

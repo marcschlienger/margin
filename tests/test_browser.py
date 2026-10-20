@@ -503,7 +503,7 @@ def test_the_format_summary_names_what_an_empty_choice_saves(page, server):
     was never going to happen."""
     _queue(page, server)
     summary = page.locator("#fmt-summary")
-    assert summary.inner_text() == "PDF, Markdown, LaTeX"
+    assert summary.inner_text() == "Markdown, LaTeX"
     page.locator("details.formats > summary").click()      # the boxes fold away
 
     page.locator(".fmt-list input[type=checkbox]").first.uncheck()
@@ -522,3 +522,146 @@ def test_the_format_summary_names_what_an_empty_choice_saves(page, server):
     fields = page.evaluate(
         "Array.from(new FormData(document.querySelector('form.saver')).keys())")
     assert "formats" not in fields
+
+
+def test_quick_save_reports_success_without_leaving_the_queue(page, server):
+    """The copy/paste path used to navigate to a transient result page.
+    Keep the result where it was requested, and refresh the live queue."""
+    posted = []
+
+    def answer_save(route, request):
+        posted.append(request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"status":"ok","summary":"Saved: article.md, article.tex",'
+                 '"files":["article.md","article.tex"],'
+                 '"warnings":["LaTeX conversion used a fallback"]}',
+        )
+
+    page.route("**/save", answer_save)
+    _queue(page, server)
+    # Count the page's call, before a service worker can satisfy it out of
+    # Playwright's sight. A network-level request observer is flaky once the
+    # worker from an earlier test controls this page.
+    page.evaluate("""() => {
+      const original = window.fetch.bind(window);
+      window.__queueRefreshes = 0;
+      window.fetch = (input, options = {}) => {
+        const raw = typeof input === 'string' ? input : input.url;
+        const url = new URL(raw, window.location.href);
+        const method = (options.method || 'GET').toUpperCase();
+        if (method === 'GET' && url.href === window.location.href) {
+          window.__queueRefreshes += 1;
+        }
+        return original(input, options);
+      };
+    }""")
+    page.fill("#save-url", "https://example.test/article")
+    page.click("#save-button")
+    page.wait_for_selector("#flash:not([hidden])")
+    page.wait_for_function("() => document.querySelector('#flash').textContent"
+                           ".startsWith('Saved:')")
+
+    assert posted == [{"url": "https://example.test/article",
+                       "formats": ["md", "tex"]}]
+    assert page.locator("#flash").inner_text() == \
+        "Saved: article.md, article.tex — Warning: " \
+        "LaTeX conversion used a fallback"
+    assert page.locator("#save-url").input_value() == ""
+    assert page.url.rstrip("/") == server.rstrip("/")
+    page.wait_for_function("() => !document.querySelector('#save-button').disabled")
+    assert page.evaluate("window.__queueRefreshes") == 1
+
+
+def test_a_refresh_failure_does_not_turn_a_successful_save_into_an_error(
+        browser, server):
+    # Page routes do not see a request handled by a service worker. This test
+    # is about the UI's failed-refresh branch, so keep that intermediary out.
+    context = browser.new_context(service_workers="block")
+    sheet = context.new_page()
+    try:
+        sheet.route(
+            "**/save",
+            lambda route: route.fulfill(
+                status=200, content_type="application/json",
+                body='{"status":"ok","summary":"Saved: article.md",'
+                     '"files":["article.md"]}',
+            ),
+        )
+        _queue(sheet, server)
+        sheet.route(server + "/", lambda route: route.fulfill(status=503))
+        sheet.fill("#save-url", "https://example.test/article")
+        sheet.click("#save-button")
+        sheet.wait_for_function(
+            "() => document.querySelector('#flash').textContent"
+            ".includes('queue could not refresh')")
+
+        assert sheet.locator("#flash").inner_text() == \
+            "Saved: article.md — The queue could not refresh; reload to see it."
+        assert "error" not in \
+            (sheet.locator("#flash").get_attribute("class") or "")
+    finally:
+        context.close()
+
+
+def test_quick_save_keeps_a_server_error_visible(page, server):
+    def refuse(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"status":"error","message":"article could not be read"}',
+        )
+
+    page.route("**/save", refuse)
+    _queue(page, server)
+    page.fill("#save-url", "https://example.test/article")
+    page.click("#save-button")
+    page.wait_for_selector("#flash.error:not([hidden])")
+
+    assert page.locator("#flash").inner_text() == \
+        "Could not save: article could not be read"
+    assert page.locator("#save-url").input_value() == \
+        "https://example.test/article"
+    assert page.locator("#save-button").is_enabled()
+
+
+def test_paste_and_save_uses_the_clipboard_url(page, server):
+    page.add_init_script("""
+      Object.defineProperty(navigator, 'clipboard', {value: {
+        readText: async () => 'https://example.test/from-clipboard'
+      }, configurable: true});
+    """)
+    posted = []
+
+    def answer_save(route, request):
+        posted.append(request.post_data_json)
+        route.fulfill(status=200, content_type="application/json",
+                      body='{"status":"ok","summary":"Already saved: note.md",'
+                           '"duplicate":true,"files":["note.md"]}')
+
+    page.route("**/save", answer_save)
+    _queue(page, server)
+    assert page.locator("#paste-save").is_visible()
+    page.click("#paste-save")
+    page.wait_for_function("() => document.querySelector('#flash').textContent"
+                           ".startsWith('Already saved:')")
+
+    assert posted[0]["url"] == "https://example.test/from-clipboard"
+
+
+def test_quick_save_form_still_works_without_javascript(browser, server):
+    context = browser.new_context(java_script_enabled=False)
+    sheet = context.new_page()
+    try:
+        sheet.goto(server)
+        form = sheet.locator("#save-form")
+        assert form.get_attribute("method") == "get"
+        assert form.get_attribute("action") == "/save-page"
+        assert sheet.locator("#save-button").is_visible()
+        assert sheet.locator("#paste-save").is_hidden()
+        checked = sheet.locator(".fmt-list input:checked").evaluate_all(
+            "els => els.map(e => e.value)")
+        assert checked == ["md", "tex"]
+    finally:
+        context.close()
